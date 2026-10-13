@@ -1,0 +1,20 @@
+name: CatalogoAG
+options:
+  bundleIdPrefix: it.catalogoag
+settings:
+  base:
+    IPHONEOS_DEPLOYMENT_TARGET: '16.0'
+    SWIFT_VERSION: '5.0'
+    CODE_SIGNING_ALLOWED: 'NO'
+targets:
+  CatalogoAG:
+    type: application
+    platform: iOS
+    sources:
+      - CatalogoAG
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: it.catalogoag.ios
+        GENERATE_INFOPLIST_FILE: YES
+        TARGETED_DEVICE_FAMILY: '1'
+        SUPPORTS_MACCATALYST: NO
