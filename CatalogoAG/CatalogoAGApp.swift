@@ -1,4 +1,5 @@
 import SwiftUI
+import Security
 
 @main
 struct CatalogoAGApp: App {
@@ -81,15 +82,8 @@ final class CatalogStore: ObservableObject {
     @Published var lastError: String?
     @Published var apiKey: String = UserDefaults.standard.string(forKey: "tmdbKey") ?? ""
     private let csvURL = URL(string: "https://docs.google.com/spreadsheets/d/e/2PACX-1vQnH2Zqe52gw2KTWFy9QpxNcqq3giSz-Xn1oAIa9Sk7cgf8-aJ4_Klri9oe2Dq8EN7CiHx0Gx87B9Av/pub?output=csv")!
-    private var base: [CatalogItem] = []
-
     init() {
-        if let url = Bundle.main.url(forResource: "catalog", withExtension: "json"),
-           let data = try? Data(contentsOf: url),
-           let decoded = try? JSONDecoder().decode([CatalogItem].self, from: data) {
-            base = decoded
-        }
-        items = base
+        // Google Sheets è l’unica fonte dei titoli: niente vecchio catalogo statico.
     }
     func setAPIKey(_ key: String) {
         apiKey = key.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -106,17 +100,19 @@ final class CatalogStore: ObservableObject {
             let (data, response) = try await URLSession.shared.data(for: request)
             guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
             guard let csv = String(data: data, encoding: .utf8) else { throw URLError(.cannotDecodeContentData) }
-            var merged = base
-            var indices = Dictionary(uniqueKeysWithValues: merged.enumerated().map { ($0.element.identity, $0.offset) })
+            var merged: [CatalogItem] = []
+            var indices: [String: Int] = [:]
             for var item in Self.parseSheet(csv) {
                 item.origin = "sheet"
                 if let existing = indices[item.identity] { merged[existing] = item }
                 else { indices[item.identity] = merged.count; merged.append(item) }
             }
+            // Un feed vuoto o con intestazioni sbagliate non deve cancellare la vista precedente.
+            guard !merged.isEmpty else { throw URLError(.cannotParseResponse) }
             items = merged.sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
             lastError = nil
         } catch {
-            lastError = "Non riesco ad aggiornare Google Sheets. Mostro i titoli già disponibili."
+            lastError = "Non riesco ad aggiornare Google Sheets. Mantengo i titoli già caricati."
         }
     }
     private static func parseSheet(_ input: String) -> [CatalogItem] {
@@ -173,11 +169,15 @@ struct MainView: View {
         }
         .tint(.cyan)
         .task { await store.refresh() }
+        .environmentObject(admin)
     }
+    @StateObject private var admin = AdminSession()
 }
 
 struct HomeView: View {
     @EnvironmentObject var store: CatalogStore
+    @EnvironmentObject var admin: AdminSession
+    @State private var showAdd = false
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 25) {
@@ -188,7 +188,7 @@ struct HomeView: View {
                 }.padding(.top, 20)
                 HStack(spacing: 12) {
                     stat("Film", store.items.filter { $0.isMovie && !$0.isTodo }.count, "film.stack")
-                    stat("Serie", store.items.filter { !$0.isMovie }.count, "tv")
+                    stat("Serie", store.items.filter { !$0.isMovie && !$0.isTodo }.count, "tv")
                     stat("Da vedere", store.items.filter { $0.isTodo }.count, "bookmark")
                 }
                 VStack(alignment: .leading, spacing: 14) {
@@ -216,7 +216,15 @@ struct HomeView: View {
             }.padding(20)
         }
         .background(Color(red: 0.025, green: 0.035, blue: 0.065))
-        .toolbar { ToolbarItem(placement: .topBarTrailing) { NavigationLink { SettingsView() } label: { Image(systemName: "gearshape") } } }
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button { showAdd = true } label: { Image(systemName: "plus.circle.fill") }
+            }
+            ToolbarItem(placement: .topBarTrailing) {
+                NavigationLink { SettingsView() } label: { Image(systemName: "gearshape") }
+            }
+        }
+        .sheet(isPresented: $showAdd) { AddMovieView() }
         .refreshable { await store.refresh() }
     }
     private func stat(_ title: String, _ count: Int, _ icon: String) -> some View {
@@ -231,13 +239,14 @@ struct HomeView: View {
 
 struct CollectionView: View {
     @EnvironmentObject var store: CatalogStore
+    @State private var showAdd = false
     let type: String
     let title: String
     @State private var query = ""
     private let columns = [GridItem(.flexible(), spacing: 13), GridItem(.flexible(), spacing: 13)]
     private var filtered: [CatalogItem] {
         store.items.filter { item in
-            let inSection = type == "todo" ? item.isTodo : type == "tv" ? !item.isMovie : item.isMovie && !item.isTodo
+            let inSection = type == "todo" ? item.isTodo : type == "tv" ? !item.isMovie && !item.isTodo : item.isMovie && !item.isTodo
             return inSection && (query.isEmpty || item.title.localizedStandardContains(query))
         }
     }
@@ -256,6 +265,12 @@ struct CollectionView: View {
         }
         .background(Color(red: 0.025, green: 0.035, blue: 0.065))
         .navigationTitle(title)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button { showAdd = true } label: { Image(systemName: "plus.circle.fill") }
+            }
+        }
+        .sheet(isPresented: $showAdd) { AddMovieView() }
         .searchable(text: $query, prompt: "Cerca per titolo")
         .overlay {
             if filtered.isEmpty {
@@ -300,8 +315,13 @@ struct PosterView: View {
 
 struct DetailView: View {
     @EnvironmentObject var store: CatalogStore
+    @EnvironmentObject var admin: AdminSession
+    @Environment(\.dismiss) private var dismiss
     let item: CatalogItem
     @State private var details: MediaDetails?
+    @State private var confirmDelete = false
+    @State private var errorMessage: String?
+    @State private var busy = false
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
@@ -319,6 +339,22 @@ struct DetailView: View {
                     }
                 }
                 Divider()
+                if admin.isLoggedIn {
+                    HStack(spacing: 12) {
+                        if item.isTodo {
+                            Button("Segna come visto") { Task { await perform("seen") } }
+                                .buttonStyle(.borderedProminent)
+                                .disabled(busy)
+                        }
+                        Button("Elimina", role: .destructive) { confirmDelete = true }
+                            .buttonStyle(.bordered)
+                            .disabled(busy)
+                    }
+                } else {
+                    NavigationLink("Accedi per modificare", destination: AdminLoginView())
+                        .font(.footnote)
+                }
+                if let errorMessage { Text(errorMessage).font(.footnote).foregroundStyle(.orange) }
                 Text("Trama").font(.title3.bold())
                 Text(details?.overview.flatMap { $0.isEmpty ? nil : $0 } ?? (store.apiKey.isEmpty ? "Aggiungi la chiave TMDb nelle impostazioni per caricare la trama." : "Trama non disponibile."))
                     .foregroundStyle(.secondary)
@@ -327,14 +363,39 @@ struct DetailView: View {
         .navigationBarTitleDisplayMode(.inline)
         .background(Color(red: 0.025, green: 0.035, blue: 0.065))
         .task(id: store.apiKey) { details = await TMDbService.details(for: item, apiKey: store.apiKey) }
+        .confirmationDialog("Eliminare \(item.title)?", isPresented: $confirmDelete) {
+            Button("Elimina definitivamente", role: .destructive) { Task { await perform("delete") } }
+        } message: { Text("Il titolo sarà eliminato da Google Sheets.") }
+    }
+    private func perform(_ operation: String) async {
+        busy = true
+        defer { busy = false }
+        do {
+            try await admin.perform(operation, title: item.title, type: item.type)
+            await store.refresh()
+            dismiss()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
     }
 }
 
 struct SettingsView: View {
     @EnvironmentObject var store: CatalogStore
+    @EnvironmentObject var admin: AdminSession
     @State private var key = ""
     var body: some View {
         Form {
+            Section("Amministrazione") {
+                if admin.isLoggedIn {
+                    Label("Accesso attivo", systemImage: "checkmark.shield")
+                    Button("Esci") { Task { await admin.logout() } }
+                } else {
+                    NavigationLink("Accedi", destination: AdminLoginView())
+                }
+                Text("Le sessioni Cloudflare durano 30 minuti. La password non viene memorizzata nell’app.")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
             Section("TMDb") {
                 SecureField("Chiave API TMDb v3", text: $key)
                     .textInputAutocapitalization(.never)
@@ -344,12 +405,252 @@ struct SettingsView: View {
                     .font(.footnote).foregroundStyle(.secondary)
             }
             Section("Sincronizzazione") {
-                LabeledContent("Google Sheets", value: "Solo lettura")
+                LabeledContent("Google Sheets", value: "Sincronizzato")
                 Button("Aggiorna catalogo") { Task { await store.refresh() } }
                 if let error = store.lastError { Text(error).foregroundStyle(.orange) }
             }
         }
         .navigationTitle("Impostazioni")
         .onAppear { key = store.apiKey }
+    }
+}
+
+
+// MARK: - API Cloudflare
+private enum AdminAPI {
+    static let base = URL(string: "https://catalogo-ag-api.joshgeogr.workers.dev")!
+
+    static func send(_ path: String, token: String? = nil, body: [String: String]? = nil) async throws -> [String: Any] {
+        let url = base.appendingPathComponent(path.trimmingCharacters(in: CharacterSet(charactersIn: "/")))
+        var request = URLRequest(url: url)
+        request.httpMethod = body == nil ? "GET" : "POST"
+        request.timeoutInterval = 25
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        if let token { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+        if let body {
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        }
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw AdminError.message("Risposta del server non valida") }
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw AdminError.message("Risposta Cloudflare non valida")
+        }
+        if http.statusCode == 401 { throw AdminError.unauthorized }
+        if http.statusCode == 429 { throw AdminError.message("Troppi tentativi. Riprova tra un minuto.") }
+        if http.statusCode >= 500 { throw AdminError.message("Errore temporaneo del server") }
+        if http.statusCode >= 400 || (json["success"] as? Bool) == false {
+            let code = (json["error"] as? String) ?? (json["message"] as? String) ?? "Operazione non riuscita"
+            throw AdminError.message(code == "ALREADY_EXISTS" ? "Il titolo è già presente" : code)
+        }
+        return json
+    }
+}
+
+private enum AdminError: LocalizedError {
+    case unauthorized
+    case message(String)
+    var errorDescription: String? {
+        switch self {
+        case .unauthorized: return "Accesso scaduto. Effettua nuovamente il login."
+        case .message(let value): return value
+        }
+    }
+}
+
+// Il token, non la password, è conservato nel Portachiavi iOS.
+private enum SessionKeychain {
+    static let account = "cloudflare-session"
+    static let service = "it.catalogoag.ios"
+    static func get() -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+    static func set(_ token: String?) {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account
+        ]
+        SecItemDelete(query as CFDictionary)
+        guard let token, let data = token.data(using: .utf8) else { return }
+        var insertion = query
+        insertion[kSecValueData as String] = data
+        insertion[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        SecItemAdd(insertion as CFDictionary, nil)
+    }
+}
+
+@MainActor
+final class AdminSession: ObservableObject {
+    @Published private(set) var isLoggedIn = false
+    @Published var errorMessage: String?
+    private var token: String?
+
+    init() {
+        token = SessionKeychain.get()
+        isLoggedIn = token != nil
+        Task { await checkSession() }
+    }
+    func checkSession() async {
+        guard let token else { isLoggedIn = false; return }
+        do {
+            let response = try await AdminAPI.send("session", token: token)
+            if (response["valid"] as? Bool) == true { isLoggedIn = true }
+            else { clear() }
+        } catch {
+            // Con rete assente non revocare il token, ma non dare accesso alle modifiche.
+            isLoggedIn = false
+        }
+    }
+    func login(password: String) async throws {
+        let response = try await AdminAPI.send("login", body: ["password": password])
+        guard let newToken = response["token"] as? String, !newToken.isEmpty else {
+            throw AdminError.message("Token non ricevuto")
+        }
+        token = newToken
+        SessionKeychain.set(newToken)
+        isLoggedIn = true
+    }
+    func logout() async {
+        if let token {
+            // La revoca lato server ha precedenza, ma l'uscita locale avviene comunque.
+            _ = try? await AdminAPI.send("logout", token: token, body: [:])
+        }
+        clear()
+    }
+    func perform(_ action: String, title: String, type: String, id: String = "", search: String = "", todo: String = "no") async throws {
+        guard let token, isLoggedIn else { throw AdminError.unauthorized }
+        let path: String
+        switch action {
+        case "add": path = "movie/add"
+        case "seen": path = "movie/seen"
+        case "delete": path = "movie/delete"
+        default: throw AdminError.message("Operazione non riconosciuta")
+        }
+        var body = ["title": title, "type": type]
+        if action == "add" {
+            body["id"] = id
+            body["search"] = search
+            body["todo"] = todo
+        }
+        do {
+            _ = try await AdminAPI.send(path, token: token, body: body)
+        } catch AdminError.unauthorized {
+            clear()
+            throw AdminError.unauthorized
+        }
+    }
+    private func clear() {
+        token = nil
+        isLoggedIn = false
+        SessionKeychain.set(nil)
+    }
+}
+
+struct AdminLoginView: View {
+    @EnvironmentObject var admin: AdminSession
+    @Environment(\.dismiss) private var dismiss
+    @State private var password = ""
+    @State private var isBusy = false
+    @State private var message: String?
+
+    var body: some View {
+        Form {
+            Section("Accesso Catalogo AG") {
+                Text("Inserisci la password amministratore Cloudflare.")
+                    .foregroundStyle(.secondary)
+                SecureField("Password", text: $password)
+                    .textContentType(.password)
+                    .submitLabel(.go)
+                    .onSubmit { Task { await authenticate() } }
+                Button(isBusy ? "Accesso in corso…" : "Accedi") {
+                    Task { await authenticate() }
+                }
+                .disabled(isBusy || password.isEmpty)
+                if let message { Text(message).foregroundStyle(.orange) }
+            }
+        }
+        .navigationTitle("Amministratore")
+    }
+    private func authenticate() async {
+        guard !password.isEmpty else { return }
+        isBusy = true
+        defer { isBusy = false }
+        do {
+            try await admin.login(password: password)
+            password = ""
+            dismiss()
+        } catch {
+            message = error.localizedDescription
+        }
+    }
+}
+
+struct AddMovieView: View {
+    @EnvironmentObject var store: CatalogStore
+    @EnvironmentObject var admin: AdminSession
+    @Environment(\.dismiss) private var dismiss
+    @State private var title = ""
+    @State private var type = "movie"
+    @State private var tmdbId = ""
+    @State private var search = ""
+    @State private var todo = false
+    @State private var busy = false
+    @State private var message: String?
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if !admin.isLoggedIn {
+                    VStack(spacing: 18) {
+                        Text("Accedi per aggiungere titoli").font(.headline)
+                        AdminLoginView()
+                    }
+                } else {
+                    Form {
+                        Section("Nuovo titolo") {
+                            TextField("Titolo", text: $title)
+                            Picker("Tipo", selection: $type) {
+                                Text("Film").tag("movie")
+                                Text("Serie TV").tag("tv")
+                            }
+                            TextField("ID TMDb (facoltativo)", text: $tmdbId)
+                                .keyboardType(.numberPad)
+                            TextField("Ricerca TMDb alternativa (facoltativa)", text: $search)
+                            Toggle("Da vedere", isOn: $todo)
+                        }
+                        Section {
+                            Button(busy ? "Salvataggio…" : "Aggiungi al catalogo") {
+                                Task { await add() }
+                            }.disabled(busy || title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                            if let message { Text(message).foregroundStyle(.orange) }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Aggiungi")
+            .toolbar { ToolbarItem(placement: .topBarLeading) { Button("Chiudi") { dismiss() } } }
+        }
+    }
+    private func add() async {
+        busy = true
+        defer { busy = false }
+        do {
+            try await admin.perform("add", title: title.trimmingCharacters(in: .whitespacesAndNewlines), type: type, id: tmdbId, search: search, todo: todo ? "yes" : "no")
+            await store.refresh()
+            dismiss()
+        } catch {
+            message = error.localizedDescription
+        }
     }
 }
