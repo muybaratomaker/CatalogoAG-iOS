@@ -82,13 +82,37 @@ final class CatalogStore: ObservableObject {
     @Published var lastError: String?
     @Published var apiKey: String = UserDefaults.standard.string(forKey: "tmdbKey") ?? ""
     private let csvURL = URL(string: "https://docs.google.com/spreadsheets/d/e/2PACX-1vQnH2Zqe52gw2KTWFy9QpxNcqq3giSz-Xn1oAIa9Sk7cgf8-aJ4_Klri9oe2Dq8EN7CiHx0Gx87B9Av/pub?output=csv")!
+    private let savedCSVKey = "catalogoAGLastValidCSV"
+
     init() {
-        // Google Sheets è l’unica fonte dei titoli: niente vecchio catalogo statico.
+        // La copia locale appare anche senza rete dopo un caricamento riuscito.
+        if let saved = UserDefaults.standard.string(forKey: savedCSVKey) {
+            items = Self.uniqueItems(from: saved)
+        }
     }
+
+    private static func uniqueItems(from csv: String) -> [CatalogItem] {
+        var merged: [CatalogItem] = []
+        var indices: [String: Int] = [:]
+        for var item in parseSheet(csv) {
+            item.origin = "sheet"
+            if let existing = indices[item.identity] {
+                merged[existing] = item
+            } else {
+                indices[item.identity] = merged.count
+                merged.append(item)
+            }
+        }
+        return merged.sorted {
+            $0.title.localizedStandardCompare($1.title) == .orderedAscending
+        }
+    }
+
     func setAPIKey(_ key: String) {
         apiKey = key.trimmingCharacters(in: .whitespacesAndNewlines)
         UserDefaults.standard.set(apiKey, forKey: "tmdbKey")
     }
+
     func refresh() async {
         guard !isLoading else { return }
         isLoading = true
@@ -96,23 +120,40 @@ final class CatalogStore: ObservableObject {
         do {
             var request = URLRequest(url: csvURL)
             request.cachePolicy = .reloadIgnoringLocalCacheData
-            request.timeoutInterval = 20
+            request.timeoutInterval = 25
+            request.setValue("text/csv,text/plain,*/*", forHTTPHeaderField: "Accept")
             let (data, response) = try await URLSession.shared.data(for: request)
-            guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
-            guard let csv = String(data: data, encoding: .utf8) else { throw URLError(.cannotDecodeContentData) }
-            var merged: [CatalogItem] = []
-            var indices: [String: Int] = [:]
-            for var item in Self.parseSheet(csv) {
-                item.origin = "sheet"
-                if let existing = indices[item.identity] { merged[existing] = item }
-                else { indices[item.identity] = merged.count; merged.append(item) }
+            guard let http = response as? HTTPURLResponse else {
+                lastError = "Google Sheets: risposta di rete non HTTP."
+                return
             }
-            // Un feed vuoto o con intestazioni sbagliate non deve cancellare la vista precedente.
-            guard !merged.isEmpty else { throw URLError(.cannotParseResponse) }
-            items = merged.sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
+            guard http.statusCode == 200 else {
+                lastError = "Google Sheets: HTTP \(http.statusCode)."
+                return
+            }
+            // Google talvolta include il BOM UTF-8 nell'intestazione CSV.
+            guard var csv = String(data: data, encoding: .utf8) else {
+                lastError = "Google Sheets: dati non leggibili come UTF-8 (\(data.count) byte)."
+                return
+            }
+            if csv.hasPrefix("\u{FEFF}") { csv.removeFirst() }
+            let firstText = csv.prefix(250).lowercased()
+            if firstText.contains("<!doctype html") || firstText.contains("<html") {
+                lastError = "Google Sheets ha restituito una pagina HTML anziché il CSV."
+                return
+            }
+            let parsed = Self.uniqueItems(from: csv)
+            guard !parsed.isEmpty else {
+                let first = csv.components(separatedBy: .newlines).first ?? ""
+                let cleanHeader = first.prefix(100).replacingOccurrences(of: "\"", with: "")
+                lastError = "CSV ricevuto ma nessun titolo letto. Prima riga: \(cleanHeader)"
+                return
+            }
+            items = parsed
+            UserDefaults.standard.set(csv, forKey: savedCSVKey)
             lastError = nil
         } catch {
-            lastError = "Non riesco ad aggiornare Google Sheets. Mantengo i titoli già caricati."
+            lastError = "Google Sheets: \(error.localizedDescription)"
         }
     }
     private static func parseSheet(_ input: String) -> [CatalogItem] {
