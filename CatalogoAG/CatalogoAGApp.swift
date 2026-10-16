@@ -146,7 +146,7 @@ final class CatalogStore: ObservableObject {
             guard !parsed.isEmpty else {
                 let first = csv.components(separatedBy: .newlines).first ?? ""
                 let cleanHeader = first.prefix(100).replacingOccurrences(of: "\"", with: "")
-                lastError = "CSV ricevuto ma nessun titolo letto. Prima riga: \(cleanHeader)"
+                lastError = "CSV ricevuto ma nessun titolo letto (\(data.count) byte). Prima riga: \(cleanHeader)"
                 return
             }
             items = parsed
@@ -156,43 +156,120 @@ final class CatalogStore: ObservableObject {
             lastError = "Google Sheets: \(error.localizedDescription)"
         }
     }
+    // Lettore CSV robusto: virgola, punto e virgola o tabulazione.
+    // Riconosce le colonne per nome, ma recupera anche i fogli esportati
+    // senza intestazione purché ogni riga abbia un tipo valido movie/tv.
     private static func parseSheet(_ input: String) -> [CatalogItem] {
-        // CSV parser: supports quoted commas, embedded line breaks, and escaped double quotes.
-        var rows: [[String]] = []
-        var row: [String] = []
-        var field = ""
-        var quoted = false
-        let chars = Array(input)
-        var i = 0
-        while i < chars.count {
-            let c = chars[i]
-            if c == "\"" {
-                if quoted && i + 1 < chars.count && chars[i + 1] == "\"" { field.append("\""); i += 1 }
-                else { quoted.toggle() }
-            } else if c == "," && !quoted {
-                row.append(field); field = ""
-            } else if (c == "\n" || c == "\r") && !quoted {
-                if c == "\r" && i + 1 < chars.count && chars[i + 1] == "\n" { i += 1 }
-                row.append(field); field = ""
-                if !row.allSatisfy({ $0.isEmpty }) { rows.append(row) }
-                row = []
-            } else { field.append(c) }
-            i += 1
+        let clean = input.replacingOccurrences(of: "\u{FEFF}", with: "")
+        let candidates: [Character] = [",", ";", "\t"]
+        let parsed = candidates.map { separator -> [[String]] in
+            var rows: [[String]] = []
+            var row: [String] = []
+            var field = ""
+            var inQuotes = false
+            let characters = Array(clean)
+            var index = 0
+
+            while index < characters.count {
+                let current = characters[index]
+                if current == "\"" {
+                    if inQuotes && index + 1 < characters.count && characters[index + 1] == "\"" {
+                        field.append("\"")
+                        index += 1
+                    } else {
+                        inQuotes.toggle()
+                    }
+                } else if current == separator && !inQuotes {
+                    row.append(field)
+                    field = ""
+                } else if (current == "\n" || current == "\r") && !inQuotes {
+                    if current == "\r" && index + 1 < characters.count && characters[index + 1] == "\n" {
+                        index += 1
+                    }
+                    row.append(field)
+                    field = ""
+                    if row.contains(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) {
+                        rows.append(row)
+                    }
+                    row = []
+                } else {
+                    field.append(current)
+                }
+                index += 1
+            }
+            if !field.isEmpty || !row.isEmpty {
+                row.append(field)
+                rows.append(row)
+            }
+            return rows
         }
-        if !field.isEmpty || !row.isEmpty { row.append(field); rows.append(row) }
-        guard let header = rows.first else { return [] }
-        let headers = header.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
-        func value(_ name: String, _ row: [String]) -> String {
-            guard let index = headers.firstIndex(of: name), index < row.count else { return "" }
-            return row[index].trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Preferiamo il separatore che produce una tabella di almeno 5 colonne.
+        let rows = parsed.max { left, right in
+            func score(_ data: [[String]]) -> Int {
+                let sample = data.prefix(15)
+                let complete = sample.filter { $0.count >= 5 }.count
+                return complete * 10 + (sample.first?.count ?? 0)
+            }
+            return score(left) < score(right)
+        } ?? []
+        guard !rows.isEmpty else { return [] }
+
+        func normalized(_ value: String) -> String {
+            value.trimmingCharacters(in: .whitespacesAndNewlines)
+                .replacingOccurrences(of: "\u{FEFF}", with: "")
+                .replacingOccurrences(of: "\"", with: "")
+                .lowercased()
         }
-        return rows.dropFirst().compactMap { row in
-            let title = value("title", row)
-            guard !title.isEmpty else { return nil }
-            let flag = value("todo", row).lowercased()
-            return CatalogItem(title: title, type: value("type", row) == "tv" ? "tv" : "movie", id: Int(value("id", row)), search: value("search", row), todo: ["yes", "1", "true"].contains(flag), origin: "sheet")
+        func cell(_ row: [String], _ column: Int) -> String {
+            guard column >= 0 && column < row.count else { return "" }
+            return row[column].trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        let titleNames = ["title", "titolo"]
+        let typeNames = ["type", "tipo"]
+        var columns = [0, 1, 2, 3, 4]
+        var firstDataRow = 0
+
+        if let headerIndex = rows.prefix(12).firstIndex(where: { row in
+            let names = row.map(normalized)
+            return names.contains(where: { titleNames.contains($0) }) &&
+                   names.contains(where: { typeNames.contains($0) })
+        }) {
+            let names = rows[headerIndex].map(normalized)
+            func find(_ options: [String], fallback: Int) -> Int {
+                names.firstIndex(where: { options.contains($0) }) ?? fallback
+            }
+            columns = [
+                find(titleNames, fallback: 0),
+                find(typeNames, fallback: 1),
+                find(["id", "tmdb", "tmdb_id"], fallback: 2),
+                find(["search", "ricerca"], fallback: 3),
+                find(["todo", "da vedere"], fallback: 4)
+            ]
+            firstDataRow = headerIndex + 1
+        }
+
+        return rows.dropFirst(firstDataRow).compactMap { row in
+            let title = cell(row, columns[0])
+            let rawType = normalized(cell(row, columns[1]))
+            // Evita di scambiare una pagina o un file errato per un catalogo.
+            guard !title.isEmpty && (rawType == "movie" || rawType == "tv") else {
+                return nil
+            }
+            let flag = normalized(cell(row, columns[4]))
+            let id = Int(cell(row, columns[2]))
+            return CatalogItem(
+                title: title,
+                type: rawType,
+                id: id,
+                search: cell(row, columns[3]),
+                todo: ["yes", "1", "true", "si", "sì"].contains(flag),
+                origin: "sheet"
+            )
         }
     }
+
 }
 
 struct MainView: View {
