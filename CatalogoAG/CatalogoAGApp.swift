@@ -160,7 +160,12 @@ final class CatalogStore: ObservableObject {
     // Riconosce le colonne per nome, ma recupera anche i fogli esportati
     // senza intestazione purché ogni riga abbia un tipo valido movie/tv.
     private static func parseSheet(_ input: String) -> [CatalogItem] {
-        let clean = input.replacingOccurrences(of: "\u{FEFF}", with: "")
+        // Google Sheets esporta righe CRLF (Windows). In Swift Character,
+        // CRLF e un unico grapheme cluster: normalizziamo PRIMA di iterare.
+        let clean = input
+            .replacingOccurrences(of: "\u{FEFF}", with: "")
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
         let candidates: [Character] = [",", ";", "\t"]
         let parsed = candidates.map { separator -> [[String]] in
             var rows: [[String]] = []
