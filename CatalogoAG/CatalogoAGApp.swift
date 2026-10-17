@@ -47,18 +47,32 @@ struct MediaDetails: Decodable {
     let release_date: String?
     let first_air_date: String?
     let vote_average: Double?
+    let genre_ids: [Int]?
+    let genres: [TMDbGenre]?
+    var genreIDs: [Int] { genres?.map(\.id) ?? genre_ids ?? [] }
     var displayTitle: String { title ?? name ?? "Titolo" }
     var releaseYear: String { String((release_date ?? first_air_date ?? "").prefix(4)) }
     var posterURL: URL? { poster_path.flatMap { URL(string: "https://image.tmdb.org/t/p/w500\($0)") } }
     var backdropURL: URL? { backdrop_path.flatMap { URL(string: "https://image.tmdb.org/t/p/w780\($0)") } }
 }
 
+struct TMDbGenre: Decodable { let id: Int; let name: String }
+
 struct SearchResponse: Decodable { let results: [MediaDetails] }
+
+actor TMDbMemoryCache {
+    static let shared = TMDbMemoryCache()
+    private var data: [String: MediaDetails] = [:]
+    func get(_ key: String) -> MediaDetails? { data[key] }
+    func put(_ value: MediaDetails, for key: String) { data[key] = value }
+}
 
 enum TMDbService {
     static func details(for item: CatalogItem, apiKey: String) async -> MediaDetails? {
         guard !apiKey.isEmpty else { return nil }
         let kind = item.isMovie ? "movie" : "tv"
+        let cacheKey = "\(kind)|\(item.id.map { String($0) } ?? (item.search.isEmpty ? item.title : item.search))|\(apiKey)"
+        if let cached = await TMDbMemoryCache.shared.get(cacheKey) { return cached }
         var parts = URLComponents(string: "https://api.themoviedb.org/3/" + (item.id == nil ? "search/\(kind)" : "\(kind)/\(item.id!)"))!
         var queries = [URLQueryItem(name: "api_key", value: apiKey), URLQueryItem(name: "language", value: "it-IT")]
         if item.id == nil {
@@ -69,8 +83,14 @@ enum TMDbService {
         do {
             let (data, response) = try await URLSession.shared.data(from: url)
             guard (response as? HTTPURLResponse)?.statusCode == 200 else { return nil }
-            if item.id != nil { return try JSONDecoder().decode(MediaDetails.self, from: data) }
-            return try JSONDecoder().decode(SearchResponse.self, from: data).results.first
+            let result: MediaDetails?
+            if item.id != nil {
+                result = try JSONDecoder().decode(MediaDetails.self, from: data)
+            } else {
+                result = try JSONDecoder().decode(SearchResponse.self, from: data).results.first
+            }
+            if let result { await TMDbMemoryCache.shared.put(result, for: cacheKey) }
+            return result
         } catch { return nil }
     }
 }
@@ -277,86 +297,217 @@ final class CatalogStore: ObservableObject {
 
 }
 
+// MARK: - Catalogo AG 2.1 — stile blu notte
+private enum AGStyle {
+    static let base = Color(red: 0.018, green: 0.043, blue: 0.084)
+    static let surface = Color(red: 0.055, green: 0.115, blue: 0.19)
+    static let surfaceLight = Color(red: 0.095, green: 0.17, blue: 0.26)
+    static let accent = Color(red: 0.19, green: 0.66, blue: 0.98)
+    static let muted = Color(red: 0.65, green: 0.74, blue: 0.86)
+    static let border = Color(red: 0.19, green: 0.35, blue: 0.53)
+    static let backdrop = LinearGradient(
+        colors: [Color(red: 0.025, green: 0.085, blue: 0.155), base, Color(red: 0.008, green: 0.022, blue: 0.045)],
+        startPoint: .topLeading, endPoint: .bottomTrailing
+    )
+}
+
 struct MainView: View {
     @EnvironmentObject var store: CatalogStore
-    var body: some View {
-        TabView {
-            NavigationStack { HomeView() }
-                .tabItem { Label("Home", systemImage: "house.fill") }
-            NavigationStack { CollectionView(type: "movie", title: "Film") }
-                .tabItem { Label("Film", systemImage: "film.fill") }
-            NavigationStack { CollectionView(type: "tv", title: "Serie TV") }
-                .tabItem { Label("Serie", systemImage: "tv.fill") }
-            NavigationStack { CollectionView(type: "todo", title: "Da vedere") }
-                .tabItem { Label("Da vedere", systemImage: "bookmark.fill") }
-        }
-        .tint(.cyan)
-        .task { await store.refresh() }
-        .environmentObject(admin)
-    }
     @StateObject private var admin = AdminSession()
+    @State private var selectedTab = 0
+
+    var body: some View {
+        TabView(selection: $selectedTab) {
+            NavigationStack { HomeView(selectedTab: $selectedTab) }
+                .tabItem { Label("Home", systemImage: "house.fill") }.tag(0)
+            NavigationStack { CollectionView(type: "movie", title: "Film") }
+                .tabItem { Label("Film", systemImage: "film.fill") }.tag(1)
+            NavigationStack { CollectionView(type: "tv", title: "Serie TV") }
+                .tabItem { Label("Serie TV", systemImage: "tv") }.tag(2)
+            NavigationStack { CollectionView(type: "todo", title: "Da vedere") }
+                .tabItem { Label("Da vedere", systemImage: "bookmark.fill") }.tag(3)
+        }
+        .tint(AGStyle.accent)
+        .environmentObject(admin)
+        .task { await store.refresh() }
+    }
 }
 
 struct HomeView: View {
     @EnvironmentObject var store: CatalogStore
-    @EnvironmentObject var admin: AdminSession
-    @State private var showAdd = false
+    @Binding var selectedTab: Int
+    @State private var heroItems: [CatalogItem] = []
+
+    private var filmCount: Int { store.items.filter { $0.isMovie && !$0.isTodo }.count }
+    private var tvCount: Int { store.items.filter { !$0.isMovie && !$0.isTodo }.count }
+
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 25) {
-                VStack(alignment: .leading, spacing: 7) {
-                    Text("LA TUA COLLEZIONE").font(.caption.weight(.semibold)).tracking(2).foregroundStyle(.cyan)
-                    Text("Catalogo AG").font(.system(size: 39, weight: .bold, design: .rounded))
-                    Text("Film e serie TV dal 2020").foregroundStyle(.secondary)
-                }.padding(.top, 20)
-                HStack(spacing: 12) {
-                    stat("Film", store.items.filter { $0.isMovie && !$0.isTodo }.count, "film.stack")
-                    stat("Serie", store.items.filter { !$0.isMovie && !$0.isTodo }.count, "tv")
-                    stat("Da vedere", store.items.filter { $0.isTodo }.count, "bookmark")
-                }
-                VStack(alignment: .leading, spacing: 14) {
-                    Text("Dal tuo catalogo").font(.title2.bold())
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(alignment: .top, spacing: 14) {
-                            ForEach(Array(store.items.filter { !$0.todo }.prefix(12)), id: \.identity) { item in
-                                NavigationLink { DetailView(item: item) } label: {
-                                    VStack(alignment: .leading, spacing: 7) {
-                                        PosterView(item: item, width: 132, height: 194)
-                                        Text(item.title).font(.caption.weight(.medium)).lineLimit(2).frame(width: 132, alignment: .leading)
-                                    }
-                                }.buttonStyle(.plain)
+        GeometryReader { geometry in
+            ScrollView(showsIndicators: false) {
+                VStack(spacing: 17) {
+                    hero(height: min(max(geometry.size.height * 0.47, 275), 380))
+                    HStack(spacing: 13) {
+                        countCard("Film", count: filmCount, subtitle: "già visti")
+                        countCard("Serie TV", count: tvCount, subtitle: "già viste")
+                    }
+                    Button { selectedTab = 3 } label: {
+                        HStack(spacing: 14) {
+                            VStack(alignment: .leading, spacing: 5) {
+                                Text("Da vedere")
+                                    .font(.system(size: 20, weight: .bold, design: .rounded))
+                                    .foregroundStyle(.white)
+                                Text("Apri la tua lista")
+                                    .font(.subheadline)
+                                    .foregroundStyle(AGStyle.muted)
                             }
+                            Spacer()
+                            Image(systemName: "arrow.up.right")
+                                .font(.system(size: 17, weight: .semibold))
+                                .foregroundStyle(AGStyle.accent)
+                                .frame(width: 40, height: 40)
+                                .background(AGStyle.surfaceLight, in: Circle())
+                        }
+                        .padding(19)
+                        .background(
+                            LinearGradient(colors: [AGStyle.surfaceLight, AGStyle.surface], startPoint: .topLeading, endPoint: .bottomTrailing),
+                            in: RoundedRectangle(cornerRadius: 19)
+                        )
+                        .overlay(RoundedRectangle(cornerRadius: 19).stroke(AGStyle.border.opacity(0.65), lineWidth: 1))
+                    }
+                    .buttonStyle(.plain)
+                    if let error = store.lastError {
+                        Label(error, systemImage: "wifi.exclamationmark")
+                            .font(.footnote).foregroundStyle(.orange)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    if store.apiKey.isEmpty {
+                        Label("Inserisci la chiave TMDb nelle impostazioni per mostrare il collage di locandine.", systemImage: "photo")
+                            .font(.footnote).foregroundStyle(AGStyle.muted)
+                    }
+                }
+                .padding(.horizontal, 18)
+                .padding(.bottom, 28)
+            }
+            .background(AGStyle.backdrop.ignoresSafeArea())
+        }
+        .toolbar(.hidden, for: .navigationBar)
+        .refreshable { await store.refresh() }
+        .onAppear { updateHeroIfNeeded() }
+        .onChange(of: store.items.count) { _ in updateHeroIfNeeded() }
+    }
+
+    private func updateHeroIfNeeded() {
+        if heroItems.isEmpty {
+            let seen = store.items.filter { $0.isMovie && !$0.isTodo }
+            // Locandine prese soltanto dal proprio catalogo, senza contenuti esterni inventati.
+            heroItems = Array(seen.filter { $0.id != nil }.shuffled().prefix(12))
+            if heroItems.count < 9 { heroItems = Array(seen.shuffled().prefix(12)) }
+        }
+    }
+
+    private func hero(height: CGFloat) -> some View {
+        ZStack(alignment: .bottomLeading) {
+            GeometryReader { geometry in
+                let tileWidth = (geometry.size.width + 56) / 3
+                LazyVGrid(columns: Array(repeating: GridItem(.fixed(tileWidth), spacing: 7), count: 3), spacing: 7) {
+                    ForEach(0..<12, id: \.self) { index in
+                        if !heroItems.isEmpty {
+                            HeroPosterTile(item: heroItems[index % heroItems.count])
+                                .frame(width: tileWidth, height: tileWidth * 1.38)
+                                .clipShape(RoundedRectangle(cornerRadius: 8))
+                        } else {
+                            RoundedRectangle(cornerRadius: 8)
+                                .fill(AGStyle.surfaceLight)
+                                .frame(width: tileWidth, height: tileWidth * 1.38)
                         }
                     }
                 }
-                if let error = store.lastError {
-                    Label(error, systemImage: "wifi.exclamationmark").font(.footnote).foregroundStyle(.orange)
-                }
-                if store.apiKey.isEmpty {
-                    Label("Per visualizzare le locandine, inserisci la chiave TMDb nelle impostazioni.", systemImage: "photo")
-                        .font(.footnote).foregroundStyle(.secondary)
-                }
-            }.padding(20)
-        }
-        .background(Color(red: 0.025, green: 0.035, blue: 0.065))
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                Button { showAdd = true } label: { Image(systemName: "plus.circle.fill") }
+                .rotationEffect(.degrees(-8))
+                .offset(x: -17, y: -48)
+                .opacity(0.8)
             }
-            ToolbarItem(placement: .topBarTrailing) {
-                NavigationLink { SettingsView() } label: { Image(systemName: "gearshape") }
+            .clipped()
+            LinearGradient(stops: [
+                .init(color: AGStyle.base.opacity(0.12), location: 0),
+                .init(color: AGStyle.base.opacity(0.35), location: 0.38),
+                .init(color: AGStyle.base.opacity(0.9), location: 0.77),
+                .init(color: AGStyle.base, location: 1)
+            ], startPoint: .top, endPoint: .bottom)
+            VStack(alignment: .leading, spacing: 8) {
+                (Text("Catalogo ").foregroundColor(.white) + Text("AG").foregroundColor(AGStyle.accent))
+                    .font(.system(size: 43, weight: .bold, design: .rounded))
+                    .minimumScaleFactor(0.7)
+                    .lineLimit(1)
+                Text("La tua collezione di film e serie TV dal 2020")
+                    .font(.subheadline)
+                    .foregroundStyle(Color.white.opacity(0.85))
+                    .fixedSize(horizontal: false, vertical: true)
             }
+            .padding(.horizontal, 14)
+            .padding(.bottom, 18)
+            HStack {
+                Spacer()
+                NavigationLink { SettingsView() } label: {
+                    Image(systemName: "gearshape")
+                        .font(.system(size: 19, weight: .medium))
+                        .foregroundStyle(.white)
+                        .frame(width: 42, height: 42)
+                        .background(AGStyle.surface.opacity(0.9), in: Circle())
+                        .overlay(Circle().stroke(AGStyle.border.opacity(0.5)))
+                }
+                .accessibilityLabel("Impostazioni")
+            }
+            .frame(maxHeight: .infinity, alignment: .top)
+            .padding(.top, 16)
+            .padding(.horizontal, 10)
         }
-        .sheet(isPresented: $showAdd) { AddMovieView() }
-        .refreshable { await store.refresh() }
+        .frame(height: height)
+        .clipShape(RoundedRectangle(cornerRadius: 22))
     }
-    private func stat(_ title: String, _ count: Int, _ icon: String) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Image(systemName: icon).foregroundStyle(.cyan)
-            Text("\(count)").font(.title2.bold())
-            Text(title).font(.caption2).foregroundStyle(.secondary)
-        }.frame(maxWidth: .infinity, alignment: .leading).padding(12)
-            .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 16))
+
+    private func countCard(_ title: String, count: Int, subtitle: String) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(title)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(AGStyle.muted)
+            Text("\(count)")
+                .font(.system(size: 43, weight: .bold, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(.white)
+                .minimumScaleFactor(0.7)
+            Text(subtitle)
+                .font(.caption)
+                .foregroundStyle(AGStyle.muted)
+        }
+        .frame(maxWidth: .infinity, minHeight: 116, alignment: .leading)
+        .padding(15)
+        .background(AGStyle.surface, in: RoundedRectangle(cornerRadius: 19))
+        .overlay(RoundedRectangle(cornerRadius: 19).stroke(AGStyle.border.opacity(0.65), lineWidth: 1))
+    }
+}
+
+private struct HeroPosterTile: View {
+    @EnvironmentObject var store: CatalogStore
+    let item: CatalogItem
+    @State private var details: MediaDetails?
+    var body: some View {
+        Group {
+            if let url = details?.posterURL {
+                AsyncImage(url: url) { image in
+                    image.resizable().scaledToFill()
+                } placeholder: {
+                    Rectangle().fill(AGStyle.surfaceLight)
+                }
+            } else {
+                Rectangle().fill(AGStyle.surfaceLight)
+                    .overlay(Image(systemName: "film").foregroundStyle(.white.opacity(0.25)))
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .clipped()
+        .task(id: store.apiKey) {
+            details = await TMDbService.details(for: item, apiKey: store.apiKey)
+        }
     }
 }
 
@@ -366,41 +517,242 @@ struct CollectionView: View {
     let type: String
     let title: String
     @State private var query = ""
+    @State private var selectedGenre = "Tutti"
+    @State private var reverseSort = false
+    @State private var showFilterMenu = false
+    @State private var genreIDs: [String: [Int]] = [:]
+    @State private var loadingGenres = false
     private let columns = [GridItem(.flexible(), spacing: 13), GridItem(.flexible(), spacing: 13)]
-    private var filtered: [CatalogItem] {
+
+    private var genreOptions: [(String, [Int])] {
+        if type == "tv" {
+            return [("Tutti", []), ("Dramma", [18]), ("Commedia", [35]), ("Crime", [80]), ("Fantascienza", [10765]), ("Azione", [10759])]
+        }
+        if type == "todo" {
+            return [("Tutti", []), ("Film", []), ("Serie TV", []), ("Azione", [28, 10759]), ("Horror", [27])]
+        }
+        return [("Tutti", []), ("Azione", [28]), ("Commedia", [35]), ("Horror", [27]), ("Thriller", [53]), ("Fantascienza", [878])]
+    }
+
+    private var sectionItems: [CatalogItem] {
         store.items.filter { item in
-            let inSection = type == "todo" ? item.isTodo : type == "tv" ? !item.isMovie && !item.isTodo : item.isMovie && !item.isTodo
-            return inSection && (query.isEmpty || item.title.localizedStandardContains(query))
+            type == "todo" ? item.isTodo : (type == "tv" ? !item.isMovie && !item.isTodo : item.isMovie && !item.isTodo)
         }
     }
+
+    private var filtered: [CatalogItem] {
+        let wantedIDs = genreOptions.first(where: { $0.0 == selectedGenre })?.1 ?? []
+        let result = sectionItems.filter { item in
+            guard query.isEmpty || item.title.localizedStandardContains(query) else { return false }
+            if selectedGenre == "Film" { return item.isMovie }
+            if selectedGenre == "Serie TV" { return !item.isMovie }
+            if wantedIDs.isEmpty { return true }
+            return !(genreIDs[item.identity] ?? []).filter { wantedIDs.contains($0) }.isEmpty
+        }
+        return result.sorted {
+            reverseSort
+                ? $0.title.localizedStandardCompare($1.title) == .orderedDescending
+                : $0.title.localizedStandardCompare($1.title) == .orderedAscending
+        }
+    }
+
     var body: some View {
-        ScrollView {
-            LazyVGrid(columns: columns, spacing: 20) {
-                ForEach(filtered, id: \.identity) { item in
-                    NavigationLink { DetailView(item: item) } label: {
-                        VStack(alignment: .leading, spacing: 7) {
-                            PosterView(item: item, width: nil, height: 230)
-                            Text(item.title).font(.subheadline.weight(.semibold)).lineLimit(2).frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                    }.buttonStyle(.plain)
+        VStack(spacing: 0) {
+            HStack(alignment: .center) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(title).font(.system(size: 34, weight: .bold, design: .rounded))
+                    Text(type == "todo" ? "Film e serie che vuoi guardare" : "La tua collezione")
+                        .font(.caption).foregroundStyle(AGStyle.muted)
                 }
-            }.padding(.horizontal, 17).padding(.top, 8).padding(.bottom, 30)
-        }
-        .background(Color(red: 0.025, green: 0.035, blue: 0.065))
-        .navigationTitle(title)
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                Button { showAdd = true } label: { Image(systemName: "plus.circle.fill") }
+                Spacer()
+                Button { showAdd = true } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 23, weight: .medium))
+                        .foregroundStyle(.white)
+                        .frame(width: 47, height: 47)
+                        .background(AGStyle.accent, in: Circle())
+                }
+                .accessibilityLabel("Aggiungi titolo")
+            }
+            .padding(.horizontal, 19)
+            .padding(.top, 10)
+            .padding(.bottom, 15)
+
+            HStack(spacing: 10) {
+                Image(systemName: "magnifyingglass").foregroundStyle(AGStyle.muted)
+                TextField(type == "movie" ? "Cerca un film..." : (type == "tv" ? "Cerca una serie TV..." : "Cerca tra i titoli da vedere..."), text: $query)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .foregroundStyle(.white)
+                if !query.isEmpty {
+                    Button { query = "" } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(AGStyle.muted) }
+                }
+            }
+            .padding(.horizontal, 15)
+            .frame(height: 45)
+            .background(AGStyle.surface, in: RoundedRectangle(cornerRadius: 14))
+            .overlay(RoundedRectangle(cornerRadius: 14).stroke(AGStyle.border.opacity(0.45), lineWidth: 1))
+            .padding(.horizontal, 19)
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(genreOptions.map { $0.0 }, id: \.self) { genre in
+                        Button { chooseGenre(genre) } label: {
+                            Text(genre)
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(selectedGenre == genre ? AGStyle.base : .white)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 9)
+                                .background(selectedGenre == genre ? AGStyle.accent : AGStyle.surface, in: Capsule())
+                                .overlay(Capsule().stroke(selectedGenre == genre ? AGStyle.accent : AGStyle.border.opacity(0.55)))
+                        }
+                        .disabled(loadingGenres)
+                    }
+                }
+                .padding(.horizontal, 19)
+            }
+            .padding(.top, 13)
+            .padding(.bottom, 9)
+
+            HStack(spacing: 8) {
+                Button { reverseSort.toggle() } label: {
+                    Label(reverseSort ? "Ordine: Z-A" : "Ordine: A-Z", systemImage: "arrow.up.arrow.down")
+                        .font(.caption)
+                        .foregroundStyle(AGStyle.muted)
+                }
+                Spacer()
+                if loadingGenres {
+                    ProgressView().tint(AGStyle.accent)
+                    Text("Caricamento generi...").font(.caption2).foregroundStyle(AGStyle.muted)
+                } else {
+                    Text("\(filtered.count) titoli").font(.caption).foregroundStyle(AGStyle.muted)
+                }
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 10)
+
+            ScrollView {
+                LazyVGrid(columns: columns, alignment: .center, spacing: 18) {
+                    ForEach(filtered, id: \.identity) { item in
+                        NavigationLink { DetailView(item: item) } label: {
+                            PosterCard(item: item)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 18)
+                .padding(.bottom, 30)
+            }
+            .refreshable { await store.refresh() }
+            .overlay {
+                if filtered.isEmpty && !loadingGenres {
+                    VStack(spacing: 10) {
+                        Image(systemName: "magnifyingglass").font(.title2)
+                        Text("Nessun titolo").font(.headline)
+                        Text("Prova un'altra ricerca o cambia filtro.").font(.footnote)
+                    }
+                    .foregroundStyle(AGStyle.muted)
+                }
             }
         }
+        .background(AGStyle.backdrop.ignoresSafeArea())
+        .toolbar(.hidden, for: .navigationBar)
         .sheet(isPresented: $showAdd) { AddMovieView() }
-        .searchable(text: $query, prompt: "Cerca per titolo")
-        .overlay {
-            if filtered.isEmpty {
-                VStack(spacing: 12) { Image(systemName: "magnifyingglass").font(.largeTitle); Text("Nessun titolo").font(.headline); Text("Prova un’altra ricerca.").foregroundStyle(.secondary) }
+    }
+
+    private func chooseGenre(_ genre: String) {
+        selectedGenre = genre
+        guard let targets = genreOptions.first(where: { $0.0 == genre })?.1, !targets.isEmpty else { return }
+        guard !store.apiKey.isEmpty else { selectedGenre = "Tutti"; return }
+        let missing = sectionItems.filter { genreIDs[$0.identity] == nil }
+        guard !missing.isEmpty else { return }
+        loadingGenres = true
+        let apiKey = store.apiKey
+        Task {
+            // Massimo quattro richieste TMDb in parallelo per non saturare la rete.
+            await withTaskGroup(of: (String, [Int]).self) { group in
+                var iterator = missing.makeIterator()
+                for _ in 0..<4 {
+                    if let item = iterator.next() {
+                        group.addTask {
+                            let details = await TMDbService.details(for: item, apiKey: apiKey)
+                            return (item.identity, details?.genreIDs ?? [])
+                        }
+                    }
+                }
+                for await (key, ids) in group {
+                    genreIDs[key] = ids
+                    if let item = iterator.next() {
+                        group.addTask {
+                            let details = await TMDbService.details(for: item, apiKey: apiKey)
+                            return (item.identity, details?.genreIDs ?? [])
+                        }
+                    }
+                }
             }
+            loadingGenres = false
         }
-        .refreshable { await store.refresh() }
+    }
+}
+
+private struct PosterCard: View {
+    @EnvironmentObject var store: CatalogStore
+    let item: CatalogItem
+    @State private var details: MediaDetails?
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            PosterImage(url: details?.posterURL, title: item.title)
+                .aspectRatio(2.0 / 3.0, contentMode: .fit)
+                .clipShape(RoundedRectangle(cornerRadius: 13))
+                .overlay(RoundedRectangle(cornerRadius: 13).stroke(AGStyle.border.opacity(0.5), lineWidth: 0.8))
+            Text(item.title)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.white)
+                .lineLimit(2)
+                .frame(height: 36, alignment: .topLeading)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Text(details?.releaseYear.isEmpty == false ? (details?.releaseYear ?? "") : (item.isMovie ? "Film" : "Serie TV"))
+                .font(.caption).foregroundStyle(AGStyle.muted)
+        }
+        .task(id: store.apiKey) {
+            details = await TMDbService.details(for: item, apiKey: store.apiKey)
+        }
+    }
+}
+
+private struct PosterImage: View {
+    let url: URL?
+    let title: String
+    var body: some View {
+        GeometryReader { geo in
+            Group {
+                if let url {
+                    AsyncImage(url: url) { phase in
+                        switch phase {
+                        case .success(let image): image.resizable().scaledToFill()
+                        default: placeholder
+                        }
+                    }
+                } else { placeholder }
+            }
+            .frame(width: geo.size.width, height: geo.size.height)
+            .clipped()
+        }
+        .background(AGStyle.surface)
+    }
+    private var placeholder: some View {
+        ZStack {
+            LinearGradient(colors: [AGStyle.surfaceLight, AGStyle.surface, AGStyle.base], startPoint: .topLeading, endPoint: .bottomTrailing)
+            Image(systemName: "film.stack")
+                .font(.system(size: 32)).foregroundStyle(.white.opacity(0.25))
+            Text(title)
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(.white.opacity(0.8))
+                .multilineTextAlignment(.center)
+                .lineLimit(3)
+                .padding(12)
+                .frame(maxHeight: .infinity, alignment: .bottom)
+        }
     }
 }
 
@@ -411,28 +763,13 @@ struct PosterView: View {
     let height: CGFloat
     @State private var details: MediaDetails?
     var body: some View {
-        Group {
-            if let url = details?.posterURL {
-                AsyncImage(url: url) { image in
-                    image.resizable().scaledToFill()
-                } placeholder: { placeholder }
-            } else { placeholder }
-        }
-        .frame(width: width, height: height)
-        .frame(maxWidth: width == nil ? .infinity : nil)
-        .clipped()
-        .background(Color.white.opacity(0.07))
-        .clipShape(RoundedRectangle(cornerRadius: 15))
-        .task(id: store.apiKey) { details = await TMDbService.details(for: item, apiKey: store.apiKey) }
-    }
-    private var placeholder: some View {
-        ZStack {
-            LinearGradient(colors: [.indigo.opacity(0.6), .black, .cyan.opacity(0.12)], startPoint: .topLeading, endPoint: .bottomTrailing)
-            VStack(spacing: 9) {
-                Image(systemName: item.isMovie ? "film" : "tv").font(.largeTitle).foregroundStyle(.white.opacity(0.7))
-                Text(item.title).font(.footnote.weight(.medium)).multilineTextAlignment(.center).padding(.horizontal, 10).lineLimit(4)
+        PosterImage(url: details?.posterURL, title: item.title)
+            .frame(width: width, height: height)
+            .frame(maxWidth: width == nil ? .infinity : nil)
+            .clipShape(RoundedRectangle(cornerRadius: 15))
+            .task(id: store.apiKey) {
+                details = await TMDbService.details(for: item, apiKey: store.apiKey)
             }
-        }
     }
 }
 
