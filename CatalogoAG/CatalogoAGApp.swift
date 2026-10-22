@@ -1056,60 +1056,306 @@ struct AdminLoginView: View {
     }
 }
 
+// MARK: - Ricerca TMDb per il modulo Aggiungi
+private enum TMDbLookup {
+    static func search(_ query: String, type: String, apiKey: String) async throws -> [MediaDetails] {
+        guard !apiKey.isEmpty else { throw TMDbLookupError.missingKey }
+        var components = URLComponents(string: "https://api.themoviedb.org/3/search/\(type)")!
+        components.queryItems = [
+            URLQueryItem(name: "api_key", value: apiKey),
+            URLQueryItem(name: "query", value: query),
+            URLQueryItem(name: "language", value: "it-IT"),
+            URLQueryItem(name: "include_adult", value: "false"),
+            URLQueryItem(name: "page", value: "1")
+        ]
+        guard let url = components.url else { throw TMDbLookupError.invalidRequest }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 15
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw TMDbLookupError.serviceUnavailable
+        }
+        return Array(try JSONDecoder().decode(SearchResponse.self, from: data).results.prefix(15))
+    }
+}
+
+private enum TMDbLookupError: LocalizedError {
+    case missingKey, invalidRequest, serviceUnavailable
+    var errorDescription: String? {
+        switch self {
+        case .missingKey: return "Inserisci prima la chiave API TMDb nelle Impostazioni dell'app."
+        case .invalidRequest: return "Ricerca non valida."
+        case .serviceUnavailable: return "TMDb non risponde. Riprova o usa l'inserimento manuale."
+        }
+    }
+}
+
 struct AddMovieView: View {
     @EnvironmentObject var store: CatalogStore
     @EnvironmentObject var admin: AdminSession
     @Environment(\.dismiss) private var dismiss
-    @State private var title = ""
+
     @State private var type = "movie"
+    @State private var query = ""
+    @State private var results: [MediaDetails] = []
+    @State private var selected: MediaDetails?
+    @State private var searching = false
+    @State private var searchMessage: String?
+    @State private var manualEntry = false
+
+    @State private var title = ""
     @State private var tmdbId = ""
-    @State private var search = ""
+    @State private var alternateSearch = ""
     @State private var todo = false
     @State private var busy = false
     @State private var message: String?
+
+    private var duplicateInCatalog: Bool {
+        let normalized = title.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return false }
+        return store.items.contains {
+            $0.type == type &&
+            $0.title.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+                .trimmingCharacters(in: .whitespacesAndNewlines) == normalized
+        }
+    }
 
     var body: some View {
         NavigationStack {
             Group {
                 if !admin.isLoggedIn {
-                    VStack(spacing: 18) {
-                        Text("Accedi per aggiungere titoli").font(.headline)
-                        AdminLoginView()
-                    }
+                    AdminLoginView()
                 } else {
                     Form {
-                        Section("Nuovo titolo") {
-                            TextField("Titolo", text: $title)
-                            Picker("Tipo", selection: $type) {
+                        Section {
+                            Picker("Cosa vuoi aggiungere?", selection: $type) {
                                 Text("Film").tag("movie")
                                 Text("Serie TV").tag("tv")
                             }
-                            TextField("ID TMDb (facoltativo)", text: $tmdbId)
-                                .keyboardType(.numberPad)
-                            TextField("Ricerca TMDb alternativa (facoltativa)", text: $search)
-                            Toggle("Da vedere", isOn: $todo)
+                            .pickerStyle(.segmented)
+                            .onChange(of: type) { _ in
+                                clearSelection()
+                                results = []
+                                searchMessage = nil
+                            }
                         }
+
+                        if !manualEntry {
+                            Section("Trova su TMDb") {
+                                HStack {
+                                    Image(systemName: "magnifyingglass")
+                                        .foregroundStyle(.secondary)
+                                    TextField(type == "movie" ? "Cerca un film..." : "Cerca una serie TV...", text: $query)
+                                        .textInputAutocapitalization(.sentences)
+                                        .autocorrectionDisabled()
+                                    if !query.isEmpty {
+                                        Button {
+                                            query = ""
+                                            clearSelection()
+                                        } label: {
+                                            Image(systemName: "xmark.circle.fill")
+                                                .foregroundStyle(.secondary)
+                                        }
+                                        .buttonStyle(.borderless)
+                                    }
+                                }
+                                if store.apiKey.isEmpty {
+                                    Label("Per cercare su TMDb, configura la chiave API nelle Impostazioni.", systemImage: "key")
+                                        .font(.footnote)
+                                        .foregroundStyle(.orange)
+                                } else if searching {
+                                    HStack {
+                                        ProgressView()
+                                        Text("Cerco su TMDb...")
+                                            .foregroundStyle(.secondary)
+                                    }
+                                } else if let searchMessage {
+                                    Text(searchMessage)
+                                        .font(.footnote)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            if selected == nil && !results.isEmpty {
+                                Section("Risultati") {
+                                    ForEach(results, id: \.id) { item in
+                                        Button { select(item) } label: {
+                                            HStack(spacing: 12) {
+                                                AsyncImage(url: item.posterURL) { phase in
+                                                    if let image = phase.image {
+                                                        image.resizable().scaledToFill()
+                                                    } else {
+                                                        RoundedRectangle(cornerRadius: 6)
+                                                            .fill(Color.gray.opacity(0.2))
+                                                            .overlay(Image(systemName: "film").foregroundStyle(.secondary))
+                                                    }
+                                                }
+                                                .frame(width: 48, height: 72)
+                                                .clipShape(RoundedRectangle(cornerRadius: 7))
+                                                VStack(alignment: .leading, spacing: 5) {
+                                                    Text(item.displayTitle)
+                                                        .font(.subheadline.weight(.semibold))
+                                                        .foregroundStyle(.primary)
+                                                        .multilineTextAlignment(.leading)
+                                                    Text(item.releaseYear.isEmpty ? "Anno non disponibile" : item.releaseYear)
+                                                        .font(.caption)
+                                                        .foregroundStyle(.secondary)
+                                                }
+                                                Spacer(minLength: 0)
+                                                Image(systemName: "chevron.right")
+                                                    .foregroundStyle(.secondary)
+                                            }
+                                        }
+                                        .buttonStyle(.plain)
+                                    }
+                                }
+                            }
+                            if let selected {
+                                Section("Titolo selezionato") {
+                                    HStack(spacing: 12) {
+                                        AsyncImage(url: selected.posterURL) { phase in
+                                            if let image = phase.image {
+                                                image.resizable().scaledToFill()
+                                            } else {
+                                                Color.gray.opacity(0.2)
+                                            }
+                                        }
+                                        .frame(width: 58, height: 88)
+                                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                                        VStack(alignment: .leading, spacing: 5) {
+                                            Text(selected.displayTitle).font(.headline)
+                                            Text(selected.releaseYear)
+                                                .font(.caption).foregroundStyle(.secondary)
+                                            Text("TMDb ID: \(selected.id)")
+                                                .font(.caption2).foregroundStyle(.secondary)
+                                        }
+                                        Spacer()
+                                    }
+                                    Button("Cambia risultato") {
+                                        clearSelection()
+                                    }
+                                    .foregroundStyle(AGStyle.accent)
+                                }
+                            }
+                        }
+
+                        if manualEntry || selected != nil {
+                            Section("Conferma aggiunta") {
+                                TextField("Titolo da salvare", text: $title)
+                                if manualEntry {
+                                    TextField("ID TMDb (facoltativo)", text: $tmdbId)
+                                        .keyboardType(.numberPad)
+                                    TextField("Ricerca alternativa (facoltativa)", text: $alternateSearch)
+                                }
+                                Toggle("Da vedere", isOn: $todo)
+                            }
+                            if duplicateInCatalog {
+                                Section {
+                                    Label("Questo titolo è già nel catalogo. Controlla prima di procedere.", systemImage: "exclamationmark.triangle")
+                                        .font(.footnote)
+                                        .foregroundStyle(.orange)
+                                }
+                            }
+                            Section {
+                                Button {
+                                    Task { await add() }
+                                } label: {
+                                    HStack {
+                                        Spacer()
+                                        if busy { ProgressView() }
+                                        Text(busy ? "Salvataggio..." : "Aggiungi al catalogo")
+                                            .fontWeight(.semibold)
+                                        Spacer()
+                                    }
+                                }
+                                .disabled(busy || duplicateInCatalog || title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                                if let message { Text(message).foregroundStyle(.orange) }
+                            }
+                        }
+
                         Section {
-                            Button(busy ? "Salvataggio…" : "Aggiungi al catalogo") {
-                                Task { await add() }
-                            }.disabled(busy || title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                            if let message { Text(message).foregroundStyle(.orange) }
+                            Button(manualEntry ? "Torna alla ricerca TMDb" : "Inserimento manuale") {
+                                manualEntry.toggle()
+                                clearSelection()
+                                message = nil
+                            }
+                        } footer: {
+                            Text("L'inserimento manuale è utile per i titoli che TMDb non trova o per usare un nome personalizzato.")
                         }
                     }
                 }
             }
-            .navigationTitle("Aggiungi")
-            .toolbar { ToolbarItem(placement: .topBarLeading) { Button("Chiudi") { dismiss() } } }
+            .navigationTitle("Aggiungi titolo")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("Chiudi") { dismiss() }
+                }
+            }
+            .task(id: "\(type)|\(query)|\(manualEntry)|\(selected?.id ?? 0)") {
+                guard admin.isLoggedIn, !manualEntry, selected == nil else { return }
+                let value = query.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard value.count >= 2 else {
+                    results = []
+                    searchMessage = value.isEmpty ? "Scrivi un titolo per cercarlo." : "Scrivi almeno due caratteri."
+                    searching = false
+                    return
+                }
+                searching = true
+                searchMessage = nil
+                do {
+                    try await Task.sleep(nanoseconds: 400_000_000)
+                    try Task.checkCancellation()
+                    let found = try await TMDbLookup.search(value, type: type, apiKey: store.apiKey)
+                    try Task.checkCancellation()
+                    results = found
+                    searchMessage = found.isEmpty ? "Nessun risultato. Prova un altro nome oppure l'inserimento manuale." : nil
+                } catch is CancellationError {
+                    return
+                } catch {
+                    results = []
+                    searchMessage = error.localizedDescription
+                }
+                searching = false
+            }
         }
     }
+
+    private func clearSelection() {
+        selected = nil
+        title = ""
+        tmdbId = ""
+        alternateSearch = ""
+        message = nil
+    }
+
+    private func select(_ item: MediaDetails) {
+        selected = item
+        title = item.displayTitle
+        tmdbId = String(item.id)
+        alternateSearch = ""
+        message = nil
+        results = []
+    }
+
     private func add() async {
+        guard !busy, !duplicateInCatalog else { return }
         busy = true
+        message = nil
         defer { busy = false }
         do {
-            try await admin.perform("add", title: title.trimmingCharacters(in: .whitespacesAndNewlines), type: type, id: tmdbId, search: search, todo: todo ? "yes" : "no")
+            try await admin.perform(
+                "add",
+                title: title.trimmingCharacters(in: .whitespacesAndNewlines),
+                type: type,
+                id: tmdbId.trimmingCharacters(in: .whitespacesAndNewlines),
+                search: alternateSearch.trimmingCharacters(in: .whitespacesAndNewlines),
+                todo: todo ? "yes" : "no"
+            )
             await store.refresh()
             dismiss()
         } catch {
+            // Non riprovare automaticamente: il salvataggio potrebbe essere già avvenuto.
             message = error.localizedDescription
         }
     }
