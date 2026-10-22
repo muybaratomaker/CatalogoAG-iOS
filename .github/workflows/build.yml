@@ -1,51 +1,121 @@
-name: Build iOS IPA
+name: Build unsigned iOS IPA
+
 on:
   workflow_dispatch:
   push:
     branches: [main]
+
 jobs:
   build:
-    runs-on: macos-15-intel
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-      - name: Prepare iOS app icon from ICO
-        run: |
-          python3 -m pip install --user Pillow
-          python3 - <<'PY'
-          from pathlib import Path
-          from PIL import Image
-          import json
 
-          source = Path('bookscanag_favicon.ico')
-          if not source.is_file():
-              raise SystemExit('Missing bookscanag_favicon.ico in repository root')
-          dest = Path('Assets.xcassets/AppIcon.appiconset')
-          dest.mkdir(parents=True, exist_ok=True)
-          image = Image.open(source).convert('RGBA')
-          image = image.resize((1024, 1024), Image.Resampling.LANCZOS)
-          # The iOS app icon must have no alpha channel.
-          background = Image.new('RGB', image.size, (255, 255, 255))
-          background.paste(image, mask=image.getchannel('A'))
-          background.save(dest / 'AppIcon.png', optimize=True)
-          (dest / 'Contents.json').write_text(json.dumps({
-              'images': [{'filename': 'AppIcon.png', 'idiom': 'universal',
-                          'platform': 'ios', 'size': '1024x1024'}],
-              'info': {'author': 'xcode', 'version': 1}
-          }, indent=2))
-          PY
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.4.app/Contents/Developer
+
       - name: Install XcodeGen
         run: brew install xcodegen
-      - name: Generate Xcode project
+
+      - name: Prepare AppIcon
+        shell: bash
+        run: |
+          set -euo pipefail
+          ICON_DIR="CatalogoAG/Assets.xcassets/AppIcon.appiconset"
+          mkdir -p "$ICON_DIR"
+          cat > "$ICON_DIR/Contents.json" <<'JSON'
+          {
+            "images": [
+              {
+                "filename": "AppIcon.png",
+                "idiom": "universal",
+                "platform": "ios",
+                "size": "1024x1024"
+              }
+            ],
+            "info": { "author": "xcode", "version": 1 }
+          }
+          JSON
+          if curl -fsSL --retry 2 --max-time 25 \
+            'https://muybaratomaker.github.io/AG-CATALAGO/favicon.png' \
+            -o /tmp/ag-favicon.png; then
+            echo 'Favicon scaricata.'
+            sips -s format jpeg /tmp/ag-favicon.png --out /tmp/ag-icon.jpg >/dev/null
+            sips -s format png -z 1024 1024 /tmp/ag-icon.jpg --out "$ICON_DIR/AppIcon.png" >/dev/null
+          else
+            echo 'ERRORE: impossibile scaricare la favicon. Build interrotta, nessuna IPA senza icona.' >&2
+            exit 1
+          fi
+          test -s "$ICON_DIR/AppIcon.png"
+          sips -g pixelWidth -g pixelHeight "$ICON_DIR/AppIcon.png"
+
+      - name: Generate project
         run: xcodegen generate
-      - name: Build for iPhone (unsigned)
+
+      - name: Build for iPhone
+        shell: bash
         run: |
-          xcodebuild -project BookScanAG.xcodeproj -scheme BookScanAG -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build CODE_SIGNING_ALLOWED=NO build
+          set -euo pipefail
+          xcodebuild -project CatalogoAG.xcodeproj -scheme CatalogoAG \
+            -configuration Release -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build CODE_SIGNING_ALLOWED=NO build
+
+      - name: Ensure compiled app icon and icon metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="build/Build/Products/Release-iphoneos/CatalogoAG.app"
+          ICON_SET="CatalogoAG/Assets.xcassets"
+          TMP_PLIST="$RUNNER_TEMP/app-icon-partial.plist"
+          test -d "$APP"
+          # Recompile the icon explicitly if XcodeGen did not embed it.
+          if [[ ! -s "$APP/Assets.car" ]]; then
+            echo 'Assets.car assente: compilo esplicitamente il catalogo icone.'
+            xcrun actool --compile "$APP" \
+              --platform iphoneos \
+              --minimum-deployment-target 16.0 \
+              --target-device iphone \
+              --app-icon AppIcon \
+              --output-partial-info-plist "$TMP_PLIST" \
+              "$ICON_SET"
+          fi
+          # Ensure plist icon dictionary exists even if XcodeGen skipped it.
+          python3 - "$APP/Info.plist" "$TMP_PLIST" <<'PY'
+          import plistlib, pathlib, sys
+          info_path = pathlib.Path(sys.argv[1])
+          partial_path = pathlib.Path(sys.argv[2])
+          with info_path.open('rb') as f:
+              info = plistlib.load(f)
+          if partial_path.is_file():
+              with partial_path.open('rb') as f:
+                  partial = plistlib.load(f)
+              for key in ('CFBundleIcons', 'CFBundleIcons~ipad', 'CFBundleIconName'):
+                  if key in partial:
+                      info[key] = partial[key]
+          # Explicit app icon name is required for modern asset-catalog icons.
+          icons = info.setdefault('CFBundleIcons', {})
+          primary = icons.setdefault('CFBundlePrimaryIcon', {})
+          primary.setdefault('CFBundleIconName', 'AppIcon')
+          with info_path.open('wb') as f:
+              plistlib.dump(info, f, fmt=plistlib.FMT_BINARY)
+          print('CFBundleIcons:', info.get('CFBundleIcons'))
+          PY
+          test -s "$APP/Assets.car" || { echo 'ERRORE: Assets.car assente.' >&2; exit 1; }
+          echo 'Icona compilata e metadati verificati.'
+
       - name: Package unsigned IPA
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p Payload
-          cp -R build/Build/Products/Release-iphoneos/BookScanAG.app Payload/
-          zip -qr BookScanAG-unsigned.ipa Payload
-      - uses: actions/upload-artifact@v4
+          cp -R build/Build/Products/Release-iphoneos/CatalogoAG.app Payload/
+          zip -qry CatalogoAG-unsigned.ipa Payload
+          unzip -l CatalogoAG-unsigned.ipa | grep 'Assets.car' \
+            || { echo 'ERRORE: icona non inclusa nella IPA.' >&2; exit 1; }
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
         with:
-          name: BookScanAG-unsigned
-          path: BookScanAG-unsigned.ipa
+          name: CatalogoAG-unsigned
+          path: CatalogoAG-unsigned.ipa
