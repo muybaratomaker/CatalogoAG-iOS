@@ -1,16 +1,22 @@
-# Catalogo AG iOS — Test 1
+# Catalogo AG iOS 2.3 — Home e modulo aggiunta rinnovati
 
-Minimal SwiftUI app to test loading an unsigned IPA in LiveContainer.
+Basato sulla versione 2.2 funzionante, senza modifiche alle API Cloudflare, al CSV o alla logica amministrativa.
 
-## Build
-1. Create a **private** GitHub repository named `CatalogoAG-iOS` (do not initialize it with files).
-2. Upload all files from this folder, preserving `.github/workflows/build.yml`.
-3. Open the repository's **Actions** tab, choose **Build unsigned iOS IPA**, and select **Run workflow** (or push to main).
-4. When the workflow succeeds, download the `CatalogoAG-unsigned` artifact. Unzip the GitHub artifact to find `CatalogoAG-unsigned.ipa`.
-5. Import the IPA into LiveContainer and try launching it.
+## Home
+- Film e Serie TV sono ora due pulsanti grandi, con contatore aggiornato e copertina TMDb sfumata; aprono direttamente la relativa sezione.
+- Da vedere è un terzo pulsante più grande, con sfondo dedicato, che apre la lista.
+- Altezza delle card calcolata in base allo spazio dello schermo; su dispositivi compatti la pagina può scorrere verticalmente.
+- Se l'immagine non è disponibile compare una sfumatura blu, senza bloccare la pagina.
 
-This IPA is **unsigned**, intended only for compatibility testing with LiveContainer. It cannot be installed directly on iOS without appropriate signing. LiveContainer compatibility is not guaranteed.
+## Aggiunta
+- Form con pannelli arrotondati in stile Catalogo AG; ricerca TMDb, scelta risultato, inserimento manuale, controllo duplicati e salvataggio rimangono invariati.
 
-## Notes
-- The current build contains demonstration content only. No Google Sheets or TMDb credentials are included.
-- Build requires GitHub-hosted macOS runner availability and suitable Actions quota.
+## Icona
+- Il workflow GitHub Actions scarica la favicon pubblica del sito (favicon.png) e la converte in un'icona iOS 1024 × 1024 senza trasparenza. Se il download fallisce usa una icona AG di riserva, senza impedire la build.
+- LiveContainer può mostrare anche una propria icona nella sua interfaccia: la personalizzazione dell'icona dell'app sulla schermata Home dipende dalle modalità di installazione.
+
+## Come aggiornare
+Sostituire sul repository i file `CatalogoAG/CatalogoAGApp.swift`, `project.yml`, `.github/workflows/build.yml` e aggiungere `CatalogoAG/Assets.xcassets/AppIcon.appiconset/Contents.json`. Non caricare soltanto lo Swift: i file aggiuntivi servono all'icona.
+
+## Verifiche
+`swiftc -frontend -parse` verifica la sintassi; la compilazione iOS vera va confermata da GitHub Actions.

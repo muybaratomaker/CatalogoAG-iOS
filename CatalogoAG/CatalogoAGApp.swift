@@ -341,52 +341,47 @@ struct HomeView: View {
     private var filmCount: Int { store.items.filter { $0.isMovie && !$0.isTodo }.count }
     private var tvCount: Int { store.items.filter { !$0.isMovie && !$0.isTodo }.count }
 
+    // La Home adatta i riquadri allo spazio disponibile sotto il collage.
     var body: some View {
         GeometryReader { geometry in
+            let heroHeight = min(max(geometry.size.height * 0.39, 215), 315)
+            let bottomHeight = max(190, geometry.size.height - heroHeight - 78)
             ScrollView(showsIndicators: false) {
-                VStack(spacing: 17) {
-                    hero(height: min(max(geometry.size.height * 0.47, 275), 380))
-                    HStack(spacing: 13) {
-                        countCard("Film", count: filmCount, subtitle: "già visti")
-                        countCard("Serie TV", count: tvCount, subtitle: "già viste")
+                VStack(spacing: 13) {
+                    hero(height: heroHeight)
+                    HStack(spacing: 12) {
+                        HomeCollectionCard(
+                            title: "Film", subtitle: "già visti", count: filmCount,
+                            tint: AGStyle.accent,
+                            sample: store.items.first(where: { $0.isMovie && !$0.isTodo && $0.id != nil }),
+                            minimumHeight: bottomHeight * 0.54
+                        ) { selectedTab = 1 }
+                        HomeCollectionCard(
+                            title: "Serie TV", subtitle: "già viste", count: tvCount,
+                            tint: Color(red: 0.66, green: 0.60, blue: 1.0),
+                            sample: store.items.first(where: { !$0.isMovie && !$0.isTodo && $0.id != nil }),
+                            minimumHeight: bottomHeight * 0.54
+                        ) { selectedTab = 2 }
                     }
-                    Button { selectedTab = 3 } label: {
-                        HStack(spacing: 14) {
-                            VStack(alignment: .leading, spacing: 5) {
-                                Text("Da vedere")
-                                    .font(.system(size: 20, weight: .bold, design: .rounded))
-                                    .foregroundStyle(.white)
-                                Text("Apri la tua lista")
-                                    .font(.subheadline)
-                                    .foregroundStyle(AGStyle.muted)
-                            }
-                            Spacer()
-                            Image(systemName: "arrow.up.right")
-                                .font(.system(size: 17, weight: .semibold))
-                                .foregroundStyle(AGStyle.accent)
-                                .frame(width: 40, height: 40)
-                                .background(AGStyle.surfaceLight, in: Circle())
-                        }
-                        .padding(19)
-                        .background(
-                            LinearGradient(colors: [AGStyle.surfaceLight, AGStyle.surface], startPoint: .topLeading, endPoint: .bottomTrailing),
-                            in: RoundedRectangle(cornerRadius: 19)
-                        )
-                        .overlay(RoundedRectangle(cornerRadius: 19).stroke(AGStyle.border.opacity(0.65), lineWidth: 1))
-                    }
-                    .buttonStyle(.plain)
+                    HomeCollectionCard(
+                        title: "Da vedere", subtitle: "Apri la tua lista", count: nil,
+                        tint: Color(red: 0.33, green: 0.79, blue: 0.92),
+                        sample: store.items.first(where: { $0.isTodo && $0.id != nil }),
+                        minimumHeight: bottomHeight * 0.46,
+                        wide: true
+                    ) { selectedTab = 3 }
                     if let error = store.lastError {
                         Label(error, systemImage: "wifi.exclamationmark")
                             .font(.footnote).foregroundStyle(.orange)
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     if store.apiKey.isEmpty {
-                        Label("Inserisci la chiave TMDb nelle impostazioni per mostrare il collage di locandine.", systemImage: "photo")
+                        Label("Imposta la chiave TMDb per vedere le copertine.", systemImage: "photo")
                             .font(.footnote).foregroundStyle(AGStyle.muted)
                     }
                 }
                 .padding(.horizontal, 18)
-                .padding(.bottom, 28)
+                .padding(.bottom, 18)
             }
             .background(AGStyle.backdrop.ignoresSafeArea())
         }
@@ -465,24 +460,92 @@ struct HomeView: View {
         .clipShape(RoundedRectangle(cornerRadius: 22))
     }
 
-    private func countCard(_ title: String, count: Int, subtitle: String) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Text(title)
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(AGStyle.muted)
-            Text("\(count)")
-                .font(.system(size: 43, weight: .bold, design: .rounded))
-                .monospacedDigit()
-                .foregroundStyle(.white)
-                .minimumScaleFactor(0.7)
-            Text(subtitle)
-                .font(.caption)
-                .foregroundStyle(AGStyle.muted)
+
+}
+
+
+// Riquadri Home con copertina sfumata e contatori: i dati sono sempre dal catalogo.
+private struct HomeCollectionCard: View {
+    @EnvironmentObject var store: CatalogStore
+    let title: String
+    let subtitle: String
+    let count: Int?
+    let tint: Color
+    let sample: CatalogItem?
+    let minimumHeight: CGFloat
+    var wide: Bool = false
+    let action: () -> Void
+    @State private var artwork: URL?
+
+    var body: some View {
+        Button(action: action) {
+            ZStack(alignment: .bottomLeading) {
+                RoundedRectangle(cornerRadius: 24)
+                    .fill(AGStyle.surfaceLight)
+                GeometryReader { proxy in
+                    AsyncImage(url: artwork) { phase in
+                        if let image = phase.image {
+                            image.resizable().scaledToFill()
+                        } else {
+                            LinearGradient(
+                                colors: [AGStyle.surfaceLight, tint.opacity(0.22), AGStyle.surface],
+                                startPoint: .topLeading, endPoint: .bottomTrailing
+                            )
+                        }
+                    }
+                    .frame(width: proxy.size.width, height: proxy.size.height)
+                    .clipped()
+                }
+                .opacity(0.58)
+                LinearGradient(
+                    stops: [
+                        .init(color: AGStyle.base.opacity(0.10), location: 0),
+                        .init(color: AGStyle.base.opacity(0.55), location: 0.43),
+                        .init(color: AGStyle.base.opacity(0.96), location: 1)
+                    ], startPoint: .top, endPoint: .bottom
+                )
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(alignment: .top) {
+                        Text(title)
+                            .font(.system(size: wide ? 25 : 22, weight: .bold, design: .rounded))
+                            .foregroundStyle(.white)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.75)
+                        Spacer(minLength: 2)
+                        Image(systemName: "arrow.up.right")
+                            .font(.system(size: 13, weight: .bold))
+                            .foregroundStyle(.white.opacity(0.9))
+                    }
+                    Spacer(minLength: 0)
+                    if let count {
+                        Text("\(count)")
+                            .font(.system(size: 47, weight: .bold, design: .rounded))
+                            .monospacedDigit()
+                            .foregroundStyle(.white)
+                            .minimumScaleFactor(0.7)
+                            .lineLimit(1)
+                    }
+                    Text(subtitle)
+                        .font(.system(size: wide ? 16 : 13, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.88))
+                }
+                .padding(wide ? 22 : 17)
+            }
+            .frame(maxWidth: .infinity)
+            .frame(height: max(wide ? 126 : 150, minimumHeight))
+            .clipShape(RoundedRectangle(cornerRadius: 24))
+            .overlay(RoundedRectangle(cornerRadius: 24).stroke(tint.opacity(0.31), lineWidth: 1))
+            .contentShape(RoundedRectangle(cornerRadius: 24))
         }
-        .frame(maxWidth: .infinity, minHeight: 116, alignment: .leading)
-        .padding(15)
-        .background(AGStyle.surface, in: RoundedRectangle(cornerRadius: 19))
-        .overlay(RoundedRectangle(cornerRadius: 19).stroke(AGStyle.border.opacity(0.65), lineWidth: 1))
+        .buttonStyle(.plain)
+        .accessibilityLabel(count.map { "\(title), \($0) \(subtitle). Apri" } ?? "\(title). Apri")
+        .task(id: "\(sample?.identity ?? "")|\(store.apiKey)") {
+            artwork = nil
+            guard let sample, !store.apiKey.isEmpty else { return }
+            if let details = await TMDbService.details(for: sample, apiKey: store.apiKey) {
+                artwork = details.backdropURL ?? details.posterURL
+            }
+        }
     }
 }
 
@@ -1121,168 +1184,212 @@ struct AddMovieView: View {
         }
     }
 
+    private var panel: some View {
+        ScrollView(showsIndicators: false) {
+            VStack(alignment: .leading, spacing: 18) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Aggiungi al catalogo")
+                        .font(.system(size: 30, weight: .bold, design: .rounded))
+                        .foregroundStyle(.white)
+                    Text("Cerca su TMDb e scegli il titolo corretto")
+                        .font(.subheadline)
+                        .foregroundStyle(AGStyle.muted)
+                }
+                .padding(.top, 14)
+
+                VStack(alignment: .leading, spacing: 14) {
+                    Text("TIPO DI CONTENUTO")
+                        .font(.caption.weight(.semibold))
+                        .tracking(1.3)
+                        .foregroundStyle(AGStyle.muted)
+                    Picker("Tipo", selection: $type) {
+                        Text("Film").tag("movie")
+                        Text("Serie TV").tag("tv")
+                    }
+                    .pickerStyle(.segmented)
+                    .onChange(of: type) { _ in
+                        clearSelection()
+                        results = []
+                        searchMessage = nil
+                    }
+                }
+                .agPanel()
+
+                if !manualEntry {
+                    VStack(alignment: .leading, spacing: 14) {
+                        Text("CERCA SU TMDB")
+                            .font(.caption.weight(.semibold))
+                            .tracking(1.3)
+                            .foregroundStyle(AGStyle.muted)
+                        HStack(spacing: 11) {
+                            Image(systemName: "magnifyingglass").foregroundStyle(AGStyle.accent)
+                            TextField(type == "movie" ? "Cerca un film..." : "Cerca una serie TV...", text: $query)
+                                .textInputAutocapitalization(.sentences)
+                                .autocorrectionDisabled()
+                                .foregroundStyle(.white)
+                                .tint(AGStyle.accent)
+                            if !query.isEmpty {
+                                Button {
+                                    query = ""
+                                    clearSelection()
+                                } label: {
+                                    Image(systemName: "xmark.circle.fill").foregroundStyle(AGStyle.muted)
+                                }
+                            }
+                        }
+                        .padding(14)
+                        .background(AGStyle.base.opacity(0.8), in: RoundedRectangle(cornerRadius: 15))
+                        .overlay(RoundedRectangle(cornerRadius: 15).stroke(AGStyle.border.opacity(0.7)))
+                        if store.apiKey.isEmpty {
+                            Label("Configura la chiave TMDb nelle Impostazioni.", systemImage: "key")
+                                .foregroundStyle(.orange)
+                                .font(.footnote)
+                        } else if searching {
+                            HStack(spacing: 10) {
+                                ProgressView()
+                                Text("Ricerca in corso...")
+                            }
+                            .font(.footnote).foregroundStyle(AGStyle.muted)
+                        } else if let searchMessage {
+                            Text(searchMessage).font(.footnote).foregroundStyle(AGStyle.muted)
+                        }
+                    }
+                    .agPanel()
+
+                    if selected == nil && !results.isEmpty {
+                        VStack(alignment: .leading, spacing: 13) {
+                            Text("RISULTATI")
+                                .font(.caption.weight(.semibold)).tracking(1.3)
+                                .foregroundStyle(AGStyle.muted)
+                            ForEach(results, id: \.id) { item in
+                                Button { select(item) } label: {
+                                    HStack(spacing: 14) {
+                                        TMDbSmallPoster(url: item.posterURL, width: 58, height: 87)
+                                        VStack(alignment: .leading, spacing: 6) {
+                                            Text(item.displayTitle)
+                                                .font(.subheadline.weight(.semibold))
+                                                .foregroundStyle(.white)
+                                                .multilineTextAlignment(.leading)
+                                            Text(item.releaseYear.isEmpty ? "Anno non disponibile" : item.releaseYear)
+                                                .font(.caption).foregroundStyle(AGStyle.muted)
+                                        }
+                                        Spacer(minLength: 0)
+                                        Image(systemName: "chevron.right").foregroundStyle(AGStyle.accent)
+                                    }
+                                    .padding(8)
+                                    .background(AGStyle.base.opacity(0.5), in: RoundedRectangle(cornerRadius: 15))
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                        .agPanel()
+                    }
+
+                    if let selected {
+                        VStack(alignment: .leading, spacing: 14) {
+                            Text("TITOLO SELEZIONATO")
+                                .font(.caption.weight(.semibold)).tracking(1.3)
+                                .foregroundStyle(AGStyle.muted)
+                            HStack(spacing: 14) {
+                                TMDbSmallPoster(url: selected.posterURL, width: 74, height: 110)
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Text(selected.displayTitle).font(.headline).foregroundStyle(.white)
+                                    Text(selected.releaseYear).font(.caption).foregroundStyle(AGStyle.muted)
+                                    Label("TMDb #\(selected.id)", systemImage: "checkmark.seal.fill")
+                                        .font(.caption).foregroundStyle(AGStyle.accent)
+                                }
+                                Spacer(minLength: 0)
+                            }
+                            Button("Cambia risultato") { clearSelection() }
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(AGStyle.accent)
+                        }
+                        .agPanel()
+                    }
+                }
+
+                if manualEntry || selected != nil {
+                    VStack(alignment: .leading, spacing: 14) {
+                        Text("CONFERMA AGGIUNTA")
+                            .font(.caption.weight(.semibold)).tracking(1.3)
+                            .foregroundStyle(AGStyle.muted)
+                        formField("Titolo da salvare", value: $title)
+                        if manualEntry {
+                            formField("ID TMDb (facoltativo)", value: $tmdbId)
+                                .keyboardType(.numberPad)
+                            formField("Ricerca alternativa (facoltativa)", value: $alternateSearch)
+                        }
+                        Toggle(isOn: $todo) {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("Da vedere").font(.headline)
+                                Text("Attiva per aggiungerlo alla lista dei titoli da vedere")
+                                    .font(.caption).foregroundStyle(AGStyle.muted)
+                            }
+                        }
+                        .tint(AGStyle.accent)
+                        if duplicateInCatalog {
+                            Label("Titolo già presente nel catalogo.", systemImage: "exclamationmark.triangle")
+                                .font(.footnote).foregroundStyle(.orange)
+                        }
+                        Button { Task { await add() } } label: {
+                            HStack(spacing: 10) {
+                                if busy { ProgressView().tint(.white) }
+                                Image(systemName: "plus.circle.fill")
+                                Text(busy ? "Salvataggio..." : "Aggiungi al catalogo")
+                            }
+                            .font(.system(size: 16, weight: .semibold))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 16)
+                            .foregroundStyle(.white)
+                            .background(AGStyle.accent, in: RoundedRectangle(cornerRadius: 16))
+                        }
+                        .disabled(busy || duplicateInCatalog || title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        .opacity((busy || duplicateInCatalog || title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) ? 0.55 : 1)
+                        if let message { Text(message).font(.footnote).foregroundStyle(.orange) }
+                    }
+                    .agPanel()
+                }
+
+                Button {
+                    manualEntry.toggle()
+                    clearSelection()
+                    message = nil
+                } label: {
+                    HStack {
+                        Image(systemName: manualEntry ? "magnifyingglass" : "square.and.pencil")
+                        Text(manualEntry ? "Torna alla ricerca TMDb" : "Inserimento manuale")
+                        Spacer()
+                        Image(systemName: "arrow.right")
+                    }
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(AGStyle.muted)
+                    .padding(18)
+                }
+                .background(AGStyle.surface.opacity(0.8), in: RoundedRectangle(cornerRadius: 18))
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 18)
+            .padding(.bottom, 30)
+        }
+        .background(AGStyle.backdrop.ignoresSafeArea())
+    }
+
+    private func formField(_ label: String, value: Binding<String>) -> some View {
+        TextField(label, text: value)
+            .padding(14)
+            .foregroundStyle(.white)
+            .tint(AGStyle.accent)
+            .background(AGStyle.base.opacity(0.78), in: RoundedRectangle(cornerRadius: 14))
+            .overlay(RoundedRectangle(cornerRadius: 14).stroke(AGStyle.border.opacity(0.7)))
+    }
+
     var body: some View {
         NavigationStack {
             Group {
                 if !admin.isLoggedIn {
                     AdminLoginView()
                 } else {
-                    Form {
-                        Section {
-                            Picker("Cosa vuoi aggiungere?", selection: $type) {
-                                Text("Film").tag("movie")
-                                Text("Serie TV").tag("tv")
-                            }
-                            .pickerStyle(.segmented)
-                            .onChange(of: type) { _ in
-                                clearSelection()
-                                results = []
-                                searchMessage = nil
-                            }
-                        }
-
-                        if !manualEntry {
-                            Section("Trova su TMDb") {
-                                HStack {
-                                    Image(systemName: "magnifyingglass")
-                                        .foregroundStyle(.secondary)
-                                    TextField(type == "movie" ? "Cerca un film..." : "Cerca una serie TV...", text: $query)
-                                        .textInputAutocapitalization(.sentences)
-                                        .autocorrectionDisabled()
-                                    if !query.isEmpty {
-                                        Button {
-                                            query = ""
-                                            clearSelection()
-                                        } label: {
-                                            Image(systemName: "xmark.circle.fill")
-                                                .foregroundStyle(.secondary)
-                                        }
-                                        .buttonStyle(.borderless)
-                                    }
-                                }
-                                if store.apiKey.isEmpty {
-                                    Label("Per cercare su TMDb, configura la chiave API nelle Impostazioni.", systemImage: "key")
-                                        .font(.footnote)
-                                        .foregroundStyle(.orange)
-                                } else if searching {
-                                    HStack {
-                                        ProgressView()
-                                        Text("Cerco su TMDb...")
-                                            .foregroundStyle(.secondary)
-                                    }
-                                } else if let searchMessage {
-                                    Text(searchMessage)
-                                        .font(.footnote)
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                            if selected == nil && !results.isEmpty {
-                                Section("Risultati") {
-                                    ForEach(results, id: \.id) { item in
-                                        Button { select(item) } label: {
-                                            HStack(spacing: 12) {
-                                                AsyncImage(url: item.posterURL) { phase in
-                                                    if let image = phase.image {
-                                                        image.resizable().scaledToFill()
-                                                    } else {
-                                                        RoundedRectangle(cornerRadius: 6)
-                                                            .fill(Color.gray.opacity(0.2))
-                                                            .overlay(Image(systemName: "film").foregroundStyle(.secondary))
-                                                    }
-                                                }
-                                                .frame(width: 48, height: 72)
-                                                .clipShape(RoundedRectangle(cornerRadius: 7))
-                                                VStack(alignment: .leading, spacing: 5) {
-                                                    Text(item.displayTitle)
-                                                        .font(.subheadline.weight(.semibold))
-                                                        .foregroundStyle(.primary)
-                                                        .multilineTextAlignment(.leading)
-                                                    Text(item.releaseYear.isEmpty ? "Anno non disponibile" : item.releaseYear)
-                                                        .font(.caption)
-                                                        .foregroundStyle(.secondary)
-                                                }
-                                                Spacer(minLength: 0)
-                                                Image(systemName: "chevron.right")
-                                                    .foregroundStyle(.secondary)
-                                            }
-                                        }
-                                        .buttonStyle(.plain)
-                                    }
-                                }
-                            }
-                            if let selected {
-                                Section("Titolo selezionato") {
-                                    HStack(spacing: 12) {
-                                        AsyncImage(url: selected.posterURL) { phase in
-                                            if let image = phase.image {
-                                                image.resizable().scaledToFill()
-                                            } else {
-                                                Color.gray.opacity(0.2)
-                                            }
-                                        }
-                                        .frame(width: 58, height: 88)
-                                        .clipShape(RoundedRectangle(cornerRadius: 8))
-                                        VStack(alignment: .leading, spacing: 5) {
-                                            Text(selected.displayTitle).font(.headline)
-                                            Text(selected.releaseYear)
-                                                .font(.caption).foregroundStyle(.secondary)
-                                            Text("TMDb ID: \(selected.id)")
-                                                .font(.caption2).foregroundStyle(.secondary)
-                                        }
-                                        Spacer()
-                                    }
-                                    Button("Cambia risultato") {
-                                        clearSelection()
-                                    }
-                                    .foregroundStyle(AGStyle.accent)
-                                }
-                            }
-                        }
-
-                        if manualEntry || selected != nil {
-                            Section("Conferma aggiunta") {
-                                TextField("Titolo da salvare", text: $title)
-                                if manualEntry {
-                                    TextField("ID TMDb (facoltativo)", text: $tmdbId)
-                                        .keyboardType(.numberPad)
-                                    TextField("Ricerca alternativa (facoltativa)", text: $alternateSearch)
-                                }
-                                Toggle("Da vedere", isOn: $todo)
-                            }
-                            if duplicateInCatalog {
-                                Section {
-                                    Label("Questo titolo è già nel catalogo. Controlla prima di procedere.", systemImage: "exclamationmark.triangle")
-                                        .font(.footnote)
-                                        .foregroundStyle(.orange)
-                                }
-                            }
-                            Section {
-                                Button {
-                                    Task { await add() }
-                                } label: {
-                                    HStack {
-                                        Spacer()
-                                        if busy { ProgressView() }
-                                        Text(busy ? "Salvataggio..." : "Aggiungi al catalogo")
-                                            .fontWeight(.semibold)
-                                        Spacer()
-                                    }
-                                }
-                                .disabled(busy || duplicateInCatalog || title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                                if let message { Text(message).foregroundStyle(.orange) }
-                            }
-                        }
-
-                        Section {
-                            Button(manualEntry ? "Torna alla ricerca TMDb" : "Inserimento manuale") {
-                                manualEntry.toggle()
-                                clearSelection()
-                                message = nil
-                            }
-                        } footer: {
-                            Text("L'inserimento manuale è utile per i titoli che TMDb non trova o per usare un nome personalizzato.")
-                        }
-                    }
+                    panel
                 }
             }
             .navigationTitle("Aggiungi titolo")
@@ -1358,5 +1465,39 @@ struct AddMovieView: View {
             // Non riprovare automaticamente: il salvataggio potrebbe essere già avvenuto.
             message = error.localizedDescription
         }
+    }
+}
+
+
+private struct AGPanelModifier: ViewModifier {
+    func body(content: Content) -> some View {
+        content
+            .padding(18)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(AGStyle.surface.opacity(0.94), in: RoundedRectangle(cornerRadius: 22))
+            .overlay(RoundedRectangle(cornerRadius: 22).stroke(AGStyle.border.opacity(0.42), lineWidth: 1))
+    }
+}
+
+private extension View {
+    func agPanel() -> some View { modifier(AGPanelModifier()) }
+}
+
+private struct TMDbSmallPoster: View {
+    let url: URL?
+    let width: CGFloat
+    let height: CGFloat
+    var body: some View {
+        AsyncImage(url: url) { phase in
+            if let image = phase.image {
+                image.resizable().scaledToFill()
+            } else {
+                Rectangle()
+                    .fill(AGStyle.surfaceLight)
+                    .overlay(Image(systemName: "film").foregroundStyle(AGStyle.muted))
+            }
+        }
+        .frame(width: width, height: height)
+        .clipShape(RoundedRectangle(cornerRadius: 10))
     }
 }
