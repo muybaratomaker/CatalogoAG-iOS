@@ -47,11 +47,18 @@ struct MediaDetails: Decodable {
     let release_date: String?
     let first_air_date: String?
     let vote_average: Double?
+    let runtime: Int?
+    let number_of_seasons: Int?
     let genre_ids: [Int]?
     let genres: [TMDbGenre]?
     var genreIDs: [Int] { genres?.map(\.id) ?? genre_ids ?? [] }
     var displayTitle: String { title ?? name ?? "Titolo" }
     var releaseYear: String { String((release_date ?? first_air_date ?? "").prefix(4)) }
+    var lengthLabel: String? {
+        if let runtime, runtime > 0 { return "\(runtime / 60) h \(runtime % 60) min" }
+        if let number_of_seasons, number_of_seasons > 0 { return "\(number_of_seasons) \(number_of_seasons == 1 ? "stagione" : "stagioni")" }
+        return nil
+    }
     var posterURL: URL? { poster_path.flatMap { URL(string: "https://image.tmdb.org/t/p/w500\($0)") } }
     var backdropURL: URL? { backdrop_path.flatMap { URL(string: "https://image.tmdb.org/t/p/w780\($0)") } }
 }
@@ -92,6 +99,30 @@ enum TMDbService {
             if let result { await TMDbMemoryCache.shared.put(result, for: cacheKey) }
             return result
         } catch { return nil }
+    }
+}
+
+// Search people by name and match their filmography against titles already in Catalogo AG.
+private struct PersonSearchResponse: Decodable { let results: [TMDbPerson] }
+private struct TMDbPerson: Decodable, Identifiable { let id: Int; let name: String }
+private struct PersonCreditsResponse: Decodable { let cast: [PersonCredit] }
+private struct PersonCredit: Decodable { let id: Int; let media_type: String? }
+private enum ActorSearchService {
+    static func matches(name: String, apiKey: String) async throws -> Set<String> {
+        func data(_ path: String, params: [URLQueryItem]) async throws -> Data {
+            var url = URLComponents(string: "https://api.themoviedb.org/3/" + path)!
+            url.queryItems = [URLQueryItem(name: "api_key", value: apiKey), URLQueryItem(name: "language", value: "it-IT")] + params
+            let (data, response) = try await URLSession.shared.data(from: url.url!)
+            guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
+            return data
+        }
+        let found = try JSONDecoder().decode(PersonSearchResponse.self, from: data("search/person", params: [URLQueryItem(name: "query", value: name)])).results
+        guard let person = found.first else { return [] }
+        let credits = try JSONDecoder().decode(PersonCreditsResponse.self, from: data("person/\(person.id)/combined_credits", params: []))
+        return Set(credits.cast.compactMap { credit -> String? in
+            guard credit.media_type == "movie" || credit.media_type == "tv" else { return nil }
+            return "\(credit.media_type!)|\(credit.id)"
+        })
     }
 }
 
@@ -580,6 +611,12 @@ struct CollectionView: View {
     let type: String
     let title: String
     @State private var query = ""
+    @FocusState private var searchFocused: Bool
+    @State private var showActorSearch = false
+    @State private var actorName = ""
+    @State private var actorMatches: Set<String>? = nil
+    @State private var actorLoading = false
+    @State private var actorError: String?
     @State private var selectedGenre = "Tutti"
     @State private var reverseSort = false
     @State private var showFilterMenu = false
@@ -607,6 +644,9 @@ struct CollectionView: View {
         let wantedIDs = genreOptions.first(where: { $0.0 == selectedGenre })?.1 ?? []
         let result = sectionItems.filter { item in
             guard query.isEmpty || item.title.localizedStandardContains(query) else { return false }
+            if let actorMatches {
+                guard let id = item.tmdbId, actorMatches.contains("\(item.isMovie ? "movie" : "tv")|\(id)") else { return false }
+            }
             if selectedGenre == "Film" { return item.isMovie }
             if selectedGenre == "Serie TV" { return !item.isMovie }
             if wantedIDs.isEmpty { return true }
@@ -642,20 +682,47 @@ struct CollectionView: View {
             .padding(.bottom, 15)
 
             HStack(spacing: 10) {
-                Image(systemName: "magnifyingglass").foregroundStyle(AGStyle.muted)
-                TextField(type == "movie" ? "Cerca un film..." : (type == "tv" ? "Cerca una serie TV..." : "Cerca tra i titoli da vedere..."), text: $query)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .foregroundStyle(.white)
-                if !query.isEmpty {
-                    Button { query = "" } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(AGStyle.muted) }
+                HStack(spacing: 10) {
+                    Image(systemName: "magnifyingglass").foregroundStyle(AGStyle.muted)
+                    TextField(type == "movie" ? "Cerca un film..." : (type == "tv" ? "Cerca una serie TV..." : "Cerca tra i titoli da vedere..."), text: $query)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .submitLabel(.search)
+                        .focused($searchFocused)
+                        .onSubmit { searchFocused = false }
+                        .foregroundStyle(.white)
+                    if !query.isEmpty {
+                        Button { query = "" } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(AGStyle.muted) }
+                    }
                 }
+                .padding(.horizontal, 13)
+                .frame(height: 45)
+                .background(AGStyle.surface, in: RoundedRectangle(cornerRadius: 14))
+                .overlay(RoundedRectangle(cornerRadius: 14).stroke(AGStyle.border.opacity(0.45), lineWidth: 1))
+
+                Button { searchFocused = false; showActorSearch = true } label: {
+                    Image(systemName: actorMatches == nil ? "person.crop.circle.badge.magnifyingglass" : "person.crop.circle.fill")
+                        .font(.system(size: 21))
+                        .foregroundStyle(actorMatches == nil ? .white : AGStyle.accent)
+                        .frame(width: 47, height: 45)
+                        .background(AGStyle.surface, in: RoundedRectangle(cornerRadius: 14))
+                }
+                .accessibilityLabel("Filtra per attore")
             }
-            .padding(.horizontal, 15)
-            .frame(height: 45)
-            .background(AGStyle.surface, in: RoundedRectangle(cornerRadius: 14))
-            .overlay(RoundedRectangle(cornerRadius: 14).stroke(AGStyle.border.opacity(0.45), lineWidth: 1))
             .padding(.horizontal, 19)
+            if actorMatches != nil {
+                HStack(spacing: 7) {
+                    Image(systemName: "person.fill")
+                    Text("Filtro per attore: \(actorName)")
+                        .lineLimit(1)
+                    Spacer(minLength: 2)
+                    Button { self.actorMatches = nil; actorName = "" } label: { Image(systemName: "xmark.circle.fill") }
+                }
+                .font(.caption)
+                .foregroundStyle(AGStyle.accent)
+                .padding(.horizontal, 21)
+                .padding(.top, 8)
+            }
 
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 8) {
@@ -707,6 +774,7 @@ struct CollectionView: View {
                 .padding(.bottom, 30)
             }
             .refreshable { await store.refresh() }
+            .scrollDismissesKeyboard(.interactively)
             .overlay {
                 if filtered.isEmpty && !loadingGenres {
                     VStack(spacing: 10) {
@@ -721,6 +789,49 @@ struct CollectionView: View {
         .background(AGStyle.backdrop.ignoresSafeArea())
         .toolbar(.hidden, for: .navigationBar)
         .sheet(isPresented: $showAdd) { AddMovieView() }
+        .sheet(isPresented: $showActorSearch) {
+            NavigationStack {
+                Form {
+                    Section("Cerca un attore o un'attrice") {
+                        TextField("Es. Brad Pitt", text: $actorName)
+                            .textInputAutocapitalization(.words)
+                            .submitLabel(.search)
+                            .onSubmit { Task { await applyActorFilter() } }
+                        Button("Cerca nel mio catalogo") { Task { await applyActorFilter() } }
+                            .disabled(actorName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || actorLoading)
+                    }
+                    if actorLoading { ProgressView("Controllo la filmografia su TMDb...") }
+                    if let actorError { Text(actorError).foregroundStyle(.orange) }
+                    Section {
+                        Button("Rimuovi filtro attore") {
+                            actorMatches = nil
+                            actorName = ""
+                            actorError = nil
+                            showActorSearch = false
+                        }
+                    }
+                }
+                .navigationTitle("Filtro per attore")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Chiudi") { showActorSearch = false } } }
+            }
+            .presentationDetents([.medium, .large])
+        }
+        .toolbar { ToolbarItemGroup(placement: .keyboard) { Spacer(); Button("Fine") { searchFocused = false } } }
+    }
+
+    private func applyActorFilter() async {
+        let name = actorName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return }
+        guard !store.apiKey.isEmpty else { actorError = "Configura prima la chiave TMDb nelle Impostazioni."; return }
+        actorLoading = true
+        actorError = nil
+        defer { actorLoading = false }
+        do {
+            let matches = try await ActorSearchService.matches(name: name, apiKey: store.apiKey)
+            actorMatches = matches
+            showActorSearch = false
+        } catch { actorError = "Ricerca non riuscita. Controlla la connessione e riprova." }
     }
 
     private func chooseGenre(_ genre: String) {
@@ -774,8 +885,11 @@ private struct PosterCard: View {
                 .lineLimit(2)
                 .frame(height: 36, alignment: .topLeading)
                 .frame(maxWidth: .infinity, alignment: .leading)
-            Text(details?.releaseYear.isEmpty == false ? (details?.releaseYear ?? "") : (item.isMovie ? "Film" : "Serie TV"))
-                .font(.caption).foregroundStyle(AGStyle.muted)
+            HStack(spacing: 5) {
+                Text(details?.releaseYear.isEmpty == false ? (details?.releaseYear ?? "") : (item.isMovie ? "Film" : "Serie TV"))
+                if let length = details?.lengthLabel { Text("· " + length).lineLimit(1) }
+            }
+            .font(.caption2).foregroundStyle(AGStyle.muted)
         }
         .task(id: store.apiKey) {
             details = await TMDbService.details(for: item, apiKey: store.apiKey)
@@ -856,6 +970,10 @@ struct DetailView: View {
                             .font(.subheadline).foregroundStyle(.secondary)
                         if item.isTodo { Label("Da vedere", systemImage: "bookmark.fill").foregroundStyle(.cyan) }
                         if let year = details?.releaseYear, !year.isEmpty { Text(year).foregroundStyle(.secondary) }
+                        if let length = details?.lengthLabel {
+                            Label(length, systemImage: item.isMovie ? "clock" : "square.stack.3d.up")
+                                .font(.subheadline).foregroundStyle(.secondary)
+                        }
                         if let rating = details?.vote_average, rating > 0 {
                             Label(String(format: "%.1f / 10", rating), systemImage: "star.fill").foregroundStyle(.yellow)
                         }
@@ -881,6 +999,10 @@ struct DetailView: View {
                 Text("Trama").font(.title3.bold())
                 Text(details?.overview.flatMap { $0.isEmpty ? nil : $0 } ?? (store.apiKey.isEmpty ? "Aggiungi la chiave TMDb nelle impostazioni per caricare la trama." : "Trama non disponibile."))
                     .foregroundStyle(.secondary)
+                if !item.isMovie && (item.tmdbId == 42009 || details?.id == 42009) {
+                    Divider()
+                    BlackMirrorEpisodePanel(seriesID: 42009, count: details?.number_of_seasons ?? 7, apiKey: store.apiKey)
+                }
             }.padding(20)
         }
         .navigationBarTitleDisplayMode(.inline)
@@ -900,6 +1022,128 @@ struct DetailView: View {
         } catch {
             errorMessage = error.localizedDescription
         }
+    }
+}
+
+// Black Mirror: episode list from TMDb. Ratings are local to this iPhone in v2.4.
+private struct SeasonEpisodes: Decodable { let episodes: [EpisodeDetails] }
+private struct EpisodeDetails: Decodable, Identifiable {
+    let id: Int
+    let name: String
+    let episode_number: Int
+    let overview: String?
+}
+
+@MainActor
+private final class BlackMirrorRatings: ObservableObject {
+    @Published var values: [String: Double] = [:] {
+        didSet {
+            guard let data = try? JSONEncoder().encode(values) else { return }
+            UserDefaults.standard.set(data, forKey: "catalogoag.blackmirror.ratings.v1")
+        }
+    }
+    init() {
+        if let data = UserDefaults.standard.data(forKey: "catalogoag.blackmirror.ratings.v1"),
+           let decoded = try? JSONDecoder().decode([String: Double].self, from: data) { values = decoded }
+    }
+    func get(_ episodeID: Int, person: String) -> Double? { values["\(episodeID)|\(person)"] }
+    func change(_ episodeID: Int, person: String, delta: Double) {
+        let key = "\(episodeID)|\(person)"
+        values[key] = min(10, max(1, (values[key] ?? (delta > 0 ? 0.5 : 1.5)) + delta))
+    }
+    func clear(_ episodeID: Int, person: String) { values.removeValue(forKey: "\(episodeID)|\(person)") }
+}
+
+private struct BlackMirrorEpisodePanel: View {
+    let seriesID: Int
+    let count: Int
+    let apiKey: String
+    @StateObject private var ratings = BlackMirrorRatings()
+    @State private var selectedSeason = 1
+    @State private var episodes: [EpisodeDetails] = []
+    @State private var loading = false
+    @State private var loadError: String?
+
+    private let faviconURL = URL(string: "https://muybaratomaker.github.io/AG-CATALAGO/favicon.png")
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Episodi e voti personali").font(.title3.bold())
+            Text("Solo Black Mirror · A e G · voti da 1 a 10, anche mezzi voti")
+                .font(.caption).foregroundStyle(.secondary)
+            if count > 0 {
+                Picker("Stagione", selection: $selectedSeason) {
+                    ForEach(1...max(1,count), id: \.self) { number in
+                        Text("Stagione \(number)").tag(number)
+                    }
+                }
+                .pickerStyle(.menu)
+            }
+            if loading { ProgressView("Caricamento episodi...") }
+            if let loadError { Text(loadError).font(.caption).foregroundStyle(.orange) }
+            ForEach(episodes) { episode in
+                VStack(alignment: .leading, spacing: 9) {
+                    Text("E\(episode.episode_number) · \(episode.name)")
+                        .font(.subheadline.weight(.semibold))
+                    HStack(spacing: 10) {
+                        ratingControl(episode.id, person: "A")
+                        ratingControl(episode.id, person: "G")
+                    }
+                }
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(AGStyle.surface, in: RoundedRectangle(cornerRadius: 14))
+            }
+            Text("In questa versione i voti sono salvati soltanto su questo iPhone. La sincronizzazione con Google Sheets arriverà con l'aggiornamento del backend.")
+                .font(.caption2).foregroundStyle(.secondary)
+        }
+        .task(id: "\(seriesID)|\(selectedSeason)|\(apiKey)") { await loadEpisodes() }
+    }
+
+    private func ratingControl(_ id: Int, person: String) -> some View {
+        let value = ratings.get(id, person: person)
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 4) {
+                Text(person).font(.caption.bold())
+                Spacer(minLength: 0)
+                if let value { Text(String(format: "%.1f", value)).font(.caption.bold()) }
+                else { Text("—").font(.caption) }
+                if let faviconURL {
+                    AsyncImage(url: faviconURL) { image in
+                        image.resizable().scaledToFit()
+                    } placeholder: { Image(systemName: "star.fill").foregroundStyle(.cyan) }
+                    .frame(width: 19, height: 19)
+                    .clipShape(RoundedRectangle(cornerRadius: 4))
+                }
+            }
+            HStack(spacing: 5) {
+                Button { ratings.change(id, person: person, delta: -0.5) } label: { Image(systemName: "minus.circle.fill") }
+                Button { ratings.change(id, person: person, delta: 0.5) } label: { Image(systemName: "plus.circle.fill") }
+                if value != nil {
+                    Button { ratings.clear(id, person: person) } label: { Image(systemName: "xmark.circle") }
+                }
+            }
+            .font(.title3)
+            .buttonStyle(.plain)
+            .foregroundStyle(AGStyle.accent)
+        }
+        .padding(9)
+        .frame(maxWidth: .infinity)
+        .background(AGStyle.surfaceLight, in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    private func loadEpisodes() async {
+        guard !apiKey.isEmpty else { loadError = "Imposta la chiave TMDb per visualizzare gli episodi."; return }
+        loading = true; loadError = nil; episodes = []
+        defer { loading = false }
+        var url = URLComponents(string: "https://api.themoviedb.org/3/tv/\(seriesID)/season/\(selectedSeason)")!
+        url.queryItems = [URLQueryItem(name: "api_key", value: apiKey), URLQueryItem(name: "language", value: "it-IT")]
+        do {
+            let (data, response) = try await URLSession.shared.data(from: url.url!)
+            guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
+            episodes = try JSONDecoder().decode(SeasonEpisodes.self, from: data).episodes
+                .sorted { $0.episode_number < $1.episode_number }
+        } catch { loadError = "Non riesco a recuperare gli episodi da TMDb." }
     }
 }
 
