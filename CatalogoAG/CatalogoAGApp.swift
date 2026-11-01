@@ -94,7 +94,22 @@ enum TMDbService {
             if item.id != nil {
                 result = try JSONDecoder().decode(MediaDetails.self, from: data)
             } else {
-                result = try JSONDecoder().decode(SearchResponse.self, from: data).results.first
+                // Search results are summaries: they do not contain runtime/season details.
+                // Fetch the selected title's full record before caching it.
+                if let match = try JSONDecoder().decode(SearchResponse.self, from: data).results.first {
+                    var detailURL = URLComponents(string: "https://api.themoviedb.org/3/\(kind)/\(match.id)")!
+                    detailURL.queryItems = [URLQueryItem(name: "api_key", value: apiKey), URLQueryItem(name: "language", value: "it-IT")]
+                    if let address = detailURL.url,
+                       let (fullData, fullResponse) = try? await URLSession.shared.data(from: address),
+                       (fullResponse as? HTTPURLResponse)?.statusCode == 200,
+                       let fullDetails = try? JSONDecoder().decode(MediaDetails.self, from: fullData) {
+                        result = fullDetails
+                    } else {
+                        result = match
+                    }
+                } else {
+                    result = nil
+                }
             }
             if let result { await TMDbMemoryCache.shared.put(result, for: cacheKey) }
             return result
@@ -102,27 +117,57 @@ enum TMDbService {
     }
 }
 
-// Search people by name and match their filmography against titles already in Catalogo AG.
+// Search an actor's full filmography and match both TMDb IDs and catalogue titles.
 private struct PersonSearchResponse: Decodable { let results: [TMDbPerson] }
 private struct TMDbPerson: Decodable, Identifiable { let id: Int; let name: String }
 private struct PersonCreditsResponse: Decodable { let cast: [PersonCredit] }
-private struct PersonCredit: Decodable { let id: Int; let media_type: String? }
+private struct PersonCredit: Decodable {
+    let id: Int
+    let media_type: String?
+    let title: String?
+    let name: String?
+    let original_title: String?
+    let original_name: String?
+}
+private struct ActorFilmography {
+    let ids: Set<String>
+    let titles: Set<String>
+}
 private enum ActorSearchService {
-    static func matches(name: String, apiKey: String) async throws -> Set<String> {
+    static func normalized(_ value: String) -> String {
+        let folded = value.folding(options: [.diacriticInsensitive, .caseInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+        return String(folded.unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) })
+    }
+
+    static func matches(name: String, apiKey: String) async throws -> ActorFilmography {
         func data(_ path: String, params: [URLQueryItem]) async throws -> Data {
             var url = URLComponents(string: "https://api.themoviedb.org/3/" + path)!
             url.queryItems = [URLQueryItem(name: "api_key", value: apiKey), URLQueryItem(name: "language", value: "it-IT")] + params
-            let (data, response) = try await URLSession.shared.data(from: url.url!)
+            let (payload, response) = try await URLSession.shared.data(from: url.url!)
             guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
-            return data
+            return payload
         }
-        let found = try JSONDecoder().decode(PersonSearchResponse.self, from: await data("search/person", params: [URLQueryItem(name: "query", value: name)])).results
-        guard let person = found.first else { return [] }
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        var found = try JSONDecoder().decode(PersonSearchResponse.self, from: await data("search/person", params: [URLQueryItem(name: "query", value: trimmed)])).results
+        // Handles variants such as "Di Caprio" vs "DiCaprio".
+        if found.isEmpty && trimmed.contains(" ") {
+            found = try JSONDecoder().decode(PersonSearchResponse.self, from: await data("search/person", params: [URLQueryItem(name: "query", value: trimmed.replacingOccurrences(of: " ", with: ""))])).results
+        }
+        guard !found.isEmpty else { return ActorFilmography(ids: [], titles: []) }
+        let needle = normalized(trimmed)
+        // Exact matches beat popularity-ranked namesakes; partial names retain TMDb ranking.
+        let person = found.first(where: { normalized($0.name) == needle }) ?? found.first!
         let credits = try JSONDecoder().decode(PersonCreditsResponse.self, from: await data("person/\(person.id)/combined_credits", params: []))
-        return Set(credits.cast.compactMap { credit -> String? in
-            guard credit.media_type == "movie" || credit.media_type == "tv" else { return nil }
-            return "\(credit.media_type!)|\(credit.id)"
-        })
+        var ids = Set<String>()
+        var titles = Set<String>()
+        for credit in credits.cast {
+            guard let kind = credit.media_type, kind == "movie" || kind == "tv" else { continue }
+            ids.insert("\(kind)|\(credit.id)")
+            for title in [credit.title, credit.name, credit.original_title, credit.original_name] {
+                if let title, !title.isEmpty { titles.insert("\(kind)|\(normalized(title))") }
+            }
+        }
+        return ActorFilmography(ids: ids, titles: titles)
     }
 }
 
@@ -614,7 +659,7 @@ struct CollectionView: View {
     @FocusState private var searchFocused: Bool
     @State private var showActorSearch = false
     @State private var actorName = ""
-    @State private var actorMatches: Set<String>? = nil
+    @State private var actorMatches: ActorFilmography? = nil
     @State private var actorLoading = false
     @State private var actorError: String?
     @State private var selectedGenre = "Tutti"
@@ -645,7 +690,12 @@ struct CollectionView: View {
         let result = sectionItems.filter { item in
             guard query.isEmpty || item.title.localizedStandardContains(query) else { return false }
             if let actorMatches {
-                guard let id = item.tmdbId, actorMatches.contains("\(item.isMovie ? "movie" : "tv")|\(id)") else { return false }
+                let kind = item.isMovie ? "movie" : "tv"
+                let matchByID = item.tmdbId.map { actorMatches.ids.contains("\(kind)|\($0)") } ?? false
+                let matchByTitle = [item.title, item.search].contains { title in
+                    !title.isEmpty && actorMatches.titles.contains("\(kind)|\(ActorSearchService.normalized(title))")
+                }
+                guard matchByID || matchByTitle else { return false }
             }
             if selectedGenre == "Film" { return item.isMovie }
             if selectedGenre == "Serie TV" { return !item.isMovie }
@@ -701,11 +751,12 @@ struct CollectionView: View {
                 .overlay(RoundedRectangle(cornerRadius: 14).stroke(AGStyle.border.opacity(0.45), lineWidth: 1))
 
                 Button { searchFocused = false; showActorSearch = true } label: {
-                    Image(systemName: actorMatches == nil ? "person.crop.circle.badge.magnifyingglass" : "person.crop.circle.fill")
+                    Image(systemName: actorMatches == nil ? "slider.horizontal.3" : "line.3.horizontal.decrease.circle.fill")
                         .font(.system(size: 21))
                         .foregroundStyle(actorMatches == nil ? .white : AGStyle.accent)
                         .frame(width: 47, height: 45)
                         .background(AGStyle.surface, in: RoundedRectangle(cornerRadius: 14))
+                        .overlay(RoundedRectangle(cornerRadius: 14).stroke(actorMatches == nil ? AGStyle.border.opacity(0.45) : AGStyle.accent, lineWidth: 1))
                 }
                 .accessibilityLabel("Filtra per attore")
             }
@@ -791,30 +842,79 @@ struct CollectionView: View {
         .sheet(isPresented: $showAdd) { AddMovieView() }
         .sheet(isPresented: $showActorSearch) {
             NavigationStack {
-                Form {
-                    Section("Cerca un attore o un'attrice") {
-                        TextField("Es. Brad Pitt", text: $actorName)
-                            .textInputAutocapitalization(.words)
-                            .submitLabel(.search)
-                            .onSubmit { Task { await applyActorFilter() } }
-                        Button("Cerca nel mio catalogo") { Task { await applyActorFilter() } }
-                            .disabled(actorName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || actorLoading)
-                    }
-                    if actorLoading { ProgressView("Controllo la filmografia su TMDb...") }
-                    if let actorError { Text(actorError).foregroundStyle(.orange) }
-                    Section {
-                        Button("Rimuovi filtro attore") {
-                            actorMatches = nil
-                            actorName = ""
-                            actorError = nil
-                            showActorSearch = false
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 19) {
+                        HStack(spacing: 13) {
+                            Image(systemName: "person.crop.circle.badge.magnifyingglass")
+                                .font(.system(size: 27))
+                                .foregroundStyle(AGStyle.accent)
+                                .frame(width: 53, height: 53)
+                                .background(AGStyle.surfaceLight, in: RoundedRectangle(cornerRadius: 17))
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Cerca per attore").font(.title3.bold()).foregroundStyle(.white)
+                                Text("Trova soltanto film e serie del tuo catalogo.")
+                                    .font(.caption).foregroundStyle(AGStyle.muted)
+                            }
+                        }
+                        VStack(alignment: .leading, spacing: 11) {
+                            Label("Nome dell'attore o attrice", systemImage: "person.text.rectangle")
+                                .font(.subheadline.weight(.semibold)).foregroundStyle(AGStyle.muted)
+                            HStack(spacing: 10) {
+                                Image(systemName: "magnifyingglass").foregroundStyle(AGStyle.muted)
+                                TextField("Es. Leonardo DiCaprio", text: $actorName)
+                                    .textInputAutocapitalization(.words)
+                                    .submitLabel(.search)
+                                    .onSubmit { Task { await applyActorFilter() } }
+                                    .foregroundStyle(.white)
+                            }
+                            .padding(14)
+                            .background(AGStyle.base, in: RoundedRectangle(cornerRadius: 13))
+                            Button { Task { await applyActorFilter() } } label: {
+                                HStack(spacing: 9) {
+                                    if actorLoading { ProgressView().tint(AGStyle.base) }
+                                    else { Image(systemName: "line.3.horizontal.decrease.circle.fill") }
+                                    Text(actorLoading ? "Ricerca in corso..." : "Mostra i titoli nel catalogo")
+                                }
+                                .font(.subheadline.weight(.bold))
+                                .foregroundStyle(AGStyle.base)
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 14)
+                                .background(AGStyle.accent, in: RoundedRectangle(cornerRadius: 13))
+                            }
+                            .disabled(actorLoading || actorName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                            .opacity(actorLoading || actorName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? 0.5 : 1)
+                        }
+                        .padding(16)
+                        .background(AGStyle.surface, in: RoundedRectangle(cornerRadius: 19))
+                        .overlay(RoundedRectangle(cornerRadius: 19).stroke(AGStyle.border.opacity(0.55)))
+                        if let actorError {
+                            Label(actorError, systemImage: "exclamationmark.triangle")
+                                .font(.footnote).foregroundStyle(.orange)
+                        }
+                        if actorMatches != nil {
+                            Button {
+                                actorMatches = nil
+                                actorName = ""
+                                actorError = nil
+                                showActorSearch = false
+                            } label: {
+                                Label("Rimuovi il filtro attore", systemImage: "xmark.circle")
+                                    .font(.subheadline.weight(.medium))
+                                    .foregroundStyle(AGStyle.muted)
+                                    .frame(maxWidth: .infinity)
+                                    .padding(13)
+                                    .background(AGStyle.surface, in: RoundedRectangle(cornerRadius: 13))
+                            }
                         }
                     }
+                    .padding(20)
                 }
-                .navigationTitle("Filtro per attore")
+                .background(AGStyle.backdrop.ignoresSafeArea())
+                .navigationTitle("Filtri")
                 .navigationBarTitleDisplayMode(.inline)
-                .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Chiudi") { showActorSearch = false } } }
+                .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Chiudi") { showActorSearch = false }.foregroundStyle(AGStyle.accent) } }
             }
+            .preferredColorScheme(.dark)
             .presentationDetents([.medium, .large])
         }
         .toolbar { ToolbarItemGroup(placement: .keyboard) { Spacer(); Button("Fine") { searchFocused = false } } }
@@ -829,8 +929,12 @@ struct CollectionView: View {
         defer { actorLoading = false }
         do {
             let matches = try await ActorSearchService.matches(name: name, apiKey: store.apiKey)
-            actorMatches = matches
-            showActorSearch = false
+            if matches.ids.isEmpty && matches.titles.isEmpty {
+                actorError = "Nessuna filmografia trovata. Prova a scrivere nome e cognome completi."
+            } else {
+                actorMatches = matches
+                showActorSearch = false
+            }
         } catch { actorError = "Ricerca non riuscita. Controlla la connessione e riprova." }
     }
 
