@@ -116,9 +116,9 @@ private enum ActorSearchService {
             guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
             return data
         }
-        let found = try JSONDecoder().decode(PersonSearchResponse.self, from: data("search/person", params: [URLQueryItem(name: "query", value: name)])).results
+        let found = try JSONDecoder().decode(PersonSearchResponse.self, from: await data("search/person", params: [URLQueryItem(name: "query", value: name)])).results
         guard let person = found.first else { return [] }
-        let credits = try JSONDecoder().decode(PersonCreditsResponse.self, from: data("person/\(person.id)/combined_credits", params: []))
+        let credits = try JSONDecoder().decode(PersonCreditsResponse.self, from: await data("person/\(person.id)/combined_credits", params: []))
         return Set(credits.cast.compactMap { credit -> String? in
             guard credit.media_type == "movie" || credit.media_type == "tv" else { return nil }
             return "\(credit.media_type!)|\(credit.id)"
