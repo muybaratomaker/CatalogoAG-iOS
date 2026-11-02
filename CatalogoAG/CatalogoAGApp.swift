@@ -1092,9 +1092,237 @@ private enum AGCastService {
     }
 }
 
+// Filmografia attore: recuperata solo quando si apre la scheda e tenuta in cache in memoria.
+private struct AGPersonFilmographyResponse: Decodable {
+    let cast: [AGPersonFilmCredit]
+}
+
+private struct AGPersonFilmCredit: Decodable, Identifiable {
+    let id: Int
+    let media_type: String
+    let title: String?
+    let name: String?
+    let release_date: String?
+    let first_air_date: String?
+    let poster_path: String?
+    let popularity: Double?
+    var displayTitle: String { title ?? name ?? "Senza titolo" }
+    var year: String { String((release_date ?? first_air_date ?? "").prefix(4)) }
+    var posterURL: URL? { poster_path.flatMap { URL(string: "https://image.tmdb.org/t/p/w342\($0)") } }
+    var mediaLabel: String { media_type == "tv" ? "Serie TV" : "Film" }
+}
+
+private actor AGFilmographyCache {
+    static let shared = AGFilmographyCache()
+    private var entries: [String: [AGPersonFilmCredit]] = [:]
+    func read(_ key: String) -> [AGPersonFilmCredit]? { entries[key] }
+    func write(_ entriesForActor: [AGPersonFilmCredit], key: String) { entries[key] = entriesForActor }
+}
+
+private enum AGFilmographyService {
+    static func fetch(personID: Int, apiKey: String) async throws -> [AGPersonFilmCredit] {
+        guard !apiKey.isEmpty else { throw URLError(.userAuthenticationRequired) }
+        let cacheKey = "\(personID)|\(apiKey)"
+        if let cached = await AGFilmographyCache.shared.read(cacheKey) { return cached }
+        var components = URLComponents(string: "https://api.themoviedb.org/3/person/\(personID)/combined_credits")!
+        components.queryItems = [
+            URLQueryItem(name: "api_key", value: apiKey),
+            URLQueryItem(name: "language", value: "it-IT")
+        ]
+        guard let url = components.url else { throw URLError(.badURL) }
+        let (data, response) = try await URLSession.shared.data(from: url)
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
+        let decoded = try JSONDecoder().decode(AGPersonFilmographyResponse.self, from: data)
+        // Uno stesso titolo può comparire più volte tra i crediti della persona.
+        var unique = Set<String>()
+        let credits = decoded.cast.filter { credit in
+            guard credit.media_type == "movie" || credit.media_type == "tv" else { return false }
+            return unique.insert("\(credit.media_type)|\(credit.id)").inserted
+        }.sorted { ($0.popularity ?? 0) > ($1.popularity ?? 0) }
+        await AGFilmographyCache.shared.write(credits, key: cacheKey)
+        return credits
+    }
+}
+
+private struct AGActorDetailView: View {
+    @EnvironmentObject private var store: CatalogStore
+    @Environment(\.dismiss) private var dismiss
+    let person: AGCastMember
+    @State private var films: [AGPersonFilmCredit] = []
+    @State private var loading = true
+    @State private var errorMessage: String?
+    @State private var showAll = false
+    @State private var selectedExternal: AGPersonFilmCredit?
+
+    private var displayed: [AGPersonFilmCredit] {
+        Array(films.prefix(showAll ? 60 : 20))
+    }
+    private func inCatalog(_ credit: AGPersonFilmCredit) -> CatalogItem? {
+        // Preferiamo sempre l'ID TMDb: non confondiamo remake e omonimi.
+        if let exact = store.items.first(where: {
+            $0.id == credit.id && ($0.isMovie ? "movie" : "tv") == credit.media_type
+        }) { return exact }
+        // Solo per vecchi titoli senza ID usiamo il nome come ripiego.
+        return store.items.first(where: {
+            $0.id == nil && ($0.isMovie ? "movie" : "tv") == credit.media_type &&
+            ActorSearchService.normalized($0.title) == ActorSearchService.normalized(credit.displayTitle)
+        })
+    }
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    HStack(alignment: .top, spacing: 16) {
+                        AsyncImage(url: person.photoURL) { image in
+                            image.resizable().scaledToFill()
+                        } placeholder: {
+                            Image(systemName: "person.crop.rectangle.fill")
+                                .foregroundStyle(AGStyle.muted)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        }
+                        .frame(width: 100, height: 138)
+                        .background(AGStyle.surface)
+                        .clipShape(RoundedRectangle(cornerRadius: 15))
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(person.name).font(.title2.bold()).foregroundStyle(.white)
+                            Text("Filmografia").font(.subheadline).foregroundStyle(AGStyle.muted)
+                            if !loading && errorMessage == nil {
+                                Text("\(films.count) titoli disponibili su TMDb")
+                                    .font(.caption).foregroundStyle(AGStyle.accent)
+                            }
+                        }
+                    }
+                    if loading {
+                        HStack(spacing: 10) { ProgressView().tint(AGStyle.accent); Text("Caricamento filmografia...") }
+                            .foregroundStyle(AGStyle.muted).padding(.vertical, 25)
+                    } else if let errorMessage {
+                        VStack(alignment: .leading, spacing: 12) {
+                            Text(errorMessage).foregroundStyle(.orange)
+                            Button("Riprova") { Task { await load() } }
+                                .buttonStyle(.borderedProminent)
+                        }
+                    } else if films.isEmpty {
+                        Text("Nessun titolo trovato.").foregroundStyle(AGStyle.muted)
+                    } else {
+                        HStack {
+                            Text("Film e serie principali").font(.title3.bold())
+                            Spacer()
+                            Text("Per popolarità").font(.caption).foregroundStyle(AGStyle.muted)
+                        }
+                        LazyVGrid(columns: [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)], spacing: 18) {
+                            ForEach(displayed) { credit in
+                                if let item = inCatalog(credit) {
+                                    NavigationLink(destination: DetailView(item: item)) {
+                                        creditCard(credit, owned: true)
+                                    }.buttonStyle(.plain)
+                                } else {
+                                    Button { selectedExternal = credit } label: {
+                                        creditCard(credit, owned: false)
+                                    }.buttonStyle(.plain)
+                                }
+                            }
+                        }
+                        if films.count > 20 {
+                            Button(showAll ? "Mostra i primi 20" : "Mostra altri titoli") {
+                                withAnimation { showAll.toggle() }
+                            }
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(AGStyle.accent)
+                            .frame(maxWidth: .infinity)
+                            .padding(12)
+                            .background(AGStyle.surface, in: RoundedRectangle(cornerRadius: 13))
+                        }
+                    }
+                }
+                .padding(18)
+            }
+            .background(AGStyle.base)
+            .navigationTitle("Attore")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Fine") { dismiss() } } }
+            .sheet(item: $selectedExternal) { credit in
+                AGExternalFilmDetail(credit: credit)
+            }
+            .task(id: person.id) { await load() }
+        }
+    }
+
+    private func creditCard(_ credit: AGPersonFilmCredit, owned: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            AsyncImage(url: credit.posterURL) { image in
+                image.resizable().scaledToFill()
+            } placeholder: {
+                ZStack {
+                    AGStyle.surface
+                    Image(systemName: credit.media_type == "tv" ? "tv" : "film")
+                        .foregroundStyle(AGStyle.muted)
+                }
+            }
+            .aspectRatio(2.0 / 3.0, contentMode: .fit)
+            .clipped()
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+            .overlay(alignment: .topLeading) {
+                if owned {
+                    Label("Nel catalogo", systemImage: "checkmark.circle.fill")
+                        .font(.system(size: 10, weight: .semibold))
+                        .padding(6)
+                        .foregroundStyle(.white)
+                        .background(AGStyle.accent, in: RoundedRectangle(cornerRadius: 8))
+                        .padding(6)
+                }
+            }
+            Text(credit.displayTitle).font(.subheadline.weight(.semibold))
+                .foregroundStyle(.white).lineLimit(2)
+            Text([credit.year, credit.mediaLabel].filter { !$0.isEmpty }.joined(separator: " · "))
+                .font(.caption2).foregroundStyle(AGStyle.muted)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func load() async {
+        loading = true
+        errorMessage = nil
+        defer { loading = false }
+        do {
+            films = try await AGFilmographyService.fetch(personID: person.id, apiKey: store.apiKey)
+        } catch {
+            errorMessage = "Impossibile caricare la filmografia. Controlla la connessione e riprova."
+        }
+    }
+}
+
+private struct AGExternalFilmDetail: View {
+    @Environment(\.dismiss) private var dismiss
+    let credit: AGPersonFilmCredit
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    AsyncImage(url: credit.posterURL) { image in image.resizable().scaledToFit() }
+                    placeholder: { Image(systemName: "film").font(.largeTitle).foregroundStyle(AGStyle.muted) }
+                        .frame(maxWidth: 200).frame(maxWidth: .infinity)
+                    Text(credit.displayTitle).font(.title2.bold())
+                    Text([credit.year, credit.mediaLabel].filter { !$0.isEmpty }.joined(separator: " · "))
+                        .foregroundStyle(AGStyle.muted)
+                    Label("Non presente nel tuo catalogo", systemImage: "plus.circle")
+                        .font(.subheadline).foregroundStyle(AGStyle.accent)
+                    Text("Puoi aggiungerlo dalla sezione Aggiungi del catalogo cercando il titolo.")
+                        .foregroundStyle(AGStyle.muted)
+                }.padding(20)
+            }
+            .background(AGStyle.base)
+            .navigationTitle("Titolo TMDb")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Fine") { dismiss() } } }
+        }
+    }
+}
+
 private struct AGCastPanel: View {
     let cast: [AGCastMember]
     @State private var showAll = false
+    @State private var selectedPerson: AGCastMember?
     var body: some View {
         if !cast.isEmpty {
             VStack(alignment: .leading, spacing: 12) {
@@ -1109,6 +1337,7 @@ private struct AGCastPanel: View {
                 }
                 LazyVGrid(columns: [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)], spacing: 14) {
                     ForEach(Array((showAll ? cast : Array(cast.prefix(8))))) { person in
+                        Button { selectedPerson = person } label: {
                         HStack(alignment: .top, spacing: 8) {
                             AsyncImage(url: person.photoURL) { image in
                                 image.resizable().scaledToFill()
@@ -1127,9 +1356,14 @@ private struct AGCastPanel: View {
                                 }
                             }
                             Spacer(minLength: 0)
+                            Image(systemName: "chevron.right").font(.system(size: 10)).foregroundStyle(AGStyle.muted)
                         }
+                        }.buttonStyle(.plain)
                     }
                 }
+            }
+            .sheet(item: $selectedPerson) { person in
+                AGActorDetailView(person: person)
             }
         }
     }
