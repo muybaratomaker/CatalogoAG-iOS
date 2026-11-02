@@ -664,10 +664,13 @@ struct CollectionView: View {
     @State private var actorError: String?
     @State private var selectedGenre = "Tutti"
     @State private var reverseSort = false
+    @AppStorage("ag_catalog_grid_columns") private var gridColumnCount = 2
     @State private var showFilterMenu = false
     @State private var genreIDs: [String: [Int]] = [:]
     @State private var loadingGenres = false
-    private let columns = [GridItem(.flexible(), spacing: 13), GridItem(.flexible(), spacing: 13)]
+    private var columns: [GridItem] {
+        Array(repeating: GridItem(.flexible(), spacing: gridColumnCount == 4 ? 8 : 13), count: gridColumnCount)
+    }
 
     private var genreOptions: [(String, [Int])] {
         if type == "tv" {
@@ -802,6 +805,16 @@ struct CollectionView: View {
                         .foregroundStyle(AGStyle.muted)
                 }
                 Spacer()
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) { gridColumnCount = (gridColumnCount == 2 ? 4 : 2) }
+                } label: {
+                    Image(systemName: gridColumnCount == 2 ? "square.grid.3x3.fill" : "square.grid.2x2.fill")
+                        .font(.system(size: 16, weight: .medium))
+                        .foregroundStyle(AGStyle.accent)
+                        .frame(width: 34, height: 30)
+                        .background(AGStyle.surface, in: RoundedRectangle(cornerRadius: 10))
+                }
+                .accessibilityLabel(gridColumnCount == 2 ? "Mostra quattro copertine per riga" : "Mostra due copertine per riga")
                 if loadingGenres {
                     ProgressView().tint(AGStyle.accent)
                     Text("Caricamento generi...").font(.caption2).foregroundStyle(AGStyle.muted)
@@ -816,12 +829,12 @@ struct CollectionView: View {
                 LazyVGrid(columns: columns, alignment: .center, spacing: 18) {
                     ForEach(filtered, id: \.identity) { item in
                         NavigationLink { DetailView(item: item) } label: {
-                            PosterCard(item: item)
+                            PosterCard(item: item, compact: gridColumnCount == 4)
                         }
                         .buttonStyle(.plain)
                     }
                 }
-                .padding(.horizontal, 18)
+                .padding(.horizontal, gridColumnCount == 4 ? 12 : 18)
                 .padding(.bottom, 30)
             }
             .refreshable { await store.refresh() }
@@ -976,24 +989,27 @@ struct CollectionView: View {
 private struct PosterCard: View {
     @EnvironmentObject var store: CatalogStore
     let item: CatalogItem
+    let compact: Bool
     @State private var details: MediaDetails?
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: compact ? 3 : 6) {
             PosterImage(url: details?.posterURL, title: item.title)
                 .aspectRatio(2.0 / 3.0, contentMode: .fit)
-                .clipShape(RoundedRectangle(cornerRadius: 13))
-                .overlay(RoundedRectangle(cornerRadius: 13).stroke(AGStyle.border.opacity(0.5), lineWidth: 0.8))
+                .clipShape(RoundedRectangle(cornerRadius: compact ? 9 : 13))
+                .overlay(RoundedRectangle(cornerRadius: compact ? 9 : 13).stroke(AGStyle.border.opacity(0.5), lineWidth: 0.8))
             Text(item.title)
-                .font(.subheadline.weight(.semibold))
+                .font(compact ? .system(size: 10, weight: .semibold) : .subheadline.weight(.semibold))
                 .foregroundStyle(.white)
-                .lineLimit(2)
-                .frame(height: 36, alignment: .topLeading)
+                .lineLimit(compact ? 2 : 2)
+                .frame(height: compact ? 27 : 36, alignment: .topLeading)
                 .frame(maxWidth: .infinity, alignment: .leading)
-            HStack(spacing: 5) {
-                Text(details?.releaseYear.isEmpty == false ? (details?.releaseYear ?? "") : (item.isMovie ? "Film" : "Serie TV"))
-                if let length = details?.lengthLabel { Text("· " + length).lineLimit(1) }
+            if !compact {
+                HStack(spacing: 5) {
+                    Text(details?.releaseYear.isEmpty == false ? (details?.releaseYear ?? "") : (item.isMovie ? "Film" : "Serie TV"))
+                    if let length = details?.lengthLabel { Text("· " + length).lineLimit(1) }
+                }
+                .font(.caption2).foregroundStyle(AGStyle.muted)
             }
-            .font(.caption2).foregroundStyle(AGStyle.muted)
         }
         .task(id: store.apiKey) {
             details = await TMDbService.details(for: item, apiKey: store.apiKey)
@@ -1054,12 +1070,78 @@ struct PosterView: View {
     }
 }
 
+private struct AGCastResponse: Decodable { let cast: [AGCastMember] }
+private struct AGCastMember: Decodable, Identifiable {
+    let id: Int
+    let name: String
+    let character: String?
+    let profile_path: String?
+    var photoURL: URL? { profile_path.flatMap { URL(string: "https://image.tmdb.org/t/p/w185\($0)") } }
+}
+
+private enum AGCastService {
+    static func fetch(kind: String, id: Int, apiKey: String) async -> [AGCastMember] {
+        guard !apiKey.isEmpty else { return [] }
+        var url = URLComponents(string: "https://api.themoviedb.org/3/\(kind)/\(id)/credits")!
+        url.queryItems = [URLQueryItem(name: "api_key", value: apiKey), URLQueryItem(name: "language", value: "it-IT")]
+        guard let endpoint = url.url,
+              let (payload, response) = try? await URLSession.shared.data(from: endpoint),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let credits = try? JSONDecoder().decode(AGCastResponse.self, from: payload) else { return [] }
+        return Array(credits.cast.prefix(24))
+    }
+}
+
+private struct AGCastPanel: View {
+    let cast: [AGCastMember]
+    @State private var showAll = false
+    var body: some View {
+        if !cast.isEmpty {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Text("Cast").font(.title3.bold())
+                    Spacer()
+                    if cast.count > 8 {
+                        Button(showAll ? "Mostra meno" : "Vedi tutti") { withAnimation { showAll.toggle() } }
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(AGStyle.accent)
+                    }
+                }
+                LazyVGrid(columns: [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)], spacing: 14) {
+                    ForEach(Array((showAll ? cast : Array(cast.prefix(8))))) { person in
+                        HStack(alignment: .top, spacing: 8) {
+                            AsyncImage(url: person.photoURL) { image in
+                                image.resizable().scaledToFill()
+                            } placeholder: {
+                                Image(systemName: "person.crop.rectangle")
+                                    .foregroundStyle(AGStyle.muted)
+                                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            }
+                            .frame(width: 43, height: 60)
+                            .background(AGStyle.surface)
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(person.name).font(.system(size: 12, weight: .semibold)).foregroundStyle(.white).fixedSize(horizontal: false, vertical: true)
+                                if let role = person.character, !role.isEmpty {
+                                    Text(role).font(.system(size: 10)).foregroundStyle(AGStyle.muted).lineLimit(2)
+                                }
+                            }
+                            Spacer(minLength: 0)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 struct DetailView: View {
     @EnvironmentObject var store: CatalogStore
     @EnvironmentObject var admin: AdminSession
     @Environment(\.dismiss) private var dismiss
     let item: CatalogItem
     @State private var details: MediaDetails?
+    @State private var cast: [AGCastMember] = []
     @State private var confirmDelete = false
     @State private var errorMessage: String?
     @State private var busy = false
@@ -1103,6 +1185,10 @@ struct DetailView: View {
                 Text("Trama").font(.title3.bold())
                 Text(details?.overview.flatMap { $0.isEmpty ? nil : $0 } ?? (store.apiKey.isEmpty ? "Aggiungi la chiave TMDb nelle impostazioni per caricare la trama." : "Trama non disponibile."))
                     .foregroundStyle(.secondary)
+                if !cast.isEmpty {
+                    Divider()
+                    AGCastPanel(cast: cast)
+                }
                 if !item.isMovie && (item.tmdbId == 42009 || details?.id == 42009) {
                     Divider()
                     BlackMirrorEpisodePanel(seriesID: 42009, count: details?.number_of_seasons ?? 7, apiKey: store.apiKey)
@@ -1111,7 +1197,14 @@ struct DetailView: View {
         }
         .navigationBarTitleDisplayMode(.inline)
         .background(Color(red: 0.025, green: 0.035, blue: 0.065))
-        .task(id: store.apiKey) { details = await TMDbService.details(for: item, apiKey: store.apiKey) }
+        .task(id: store.apiKey) {
+            details = await TMDbService.details(for: item, apiKey: store.apiKey)
+            if let id = details?.id {
+                cast = await AGCastService.fetch(kind: item.isMovie ? "movie" : "tv", id: id, apiKey: store.apiKey)
+            } else {
+                cast = []
+            }
+        }
         .confirmationDialog("Eliminare \(item.title)?", isPresented: $confirmDelete) {
             Button("Elimina definitivamente", role: .destructive) { Task { await perform("delete") } }
         } message: { Text("Il titolo sarà eliminato da Google Sheets.") }
