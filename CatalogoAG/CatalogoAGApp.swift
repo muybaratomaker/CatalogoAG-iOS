@@ -74,6 +74,59 @@ actor TMDbMemoryCache {
     func put(_ value: MediaDetails, for key: String) { data[key] = value }
 }
 
+// Diagnostica locale: conta esclusivamente le chiamate API effettivamente inviate a TMDb.
+// Le immagini, la cache, Google Sheets e Cloudflare non rientrano nel conteggio.
+@MainActor
+private final class AGTMDbDiagnostics: ObservableObject {
+    static let shared = AGTMDbDiagnostics()
+    @Published private(set) var sessionRequests = 0
+    @Published private(set) var http429 = 0
+    @Published private(set) var peakPerSecond = 0
+    @Published private(set) var recentMinute = 0
+    private var timestamps: [Date] = []
+    private init() {}
+
+    func recordRequest() {
+        let now = Date()
+        sessionRequests += 1
+        timestamps.append(now)
+        timestamps.removeAll { now.timeIntervalSince($0) > 60 }
+        recentMinute = timestamps.count
+        let currentSecond = timestamps.filter { now.timeIntervalSince($0) < 1 }.count
+        peakPerSecond = max(peakPerSecond, currentSecond)
+    }
+    func recordResponse(_ response: URLResponse) {
+        if (response as? HTTPURLResponse)?.statusCode == 429 { http429 += 1 }
+    }
+    func clear() {
+        sessionRequests = 0
+        http429 = 0
+        peakPerSecond = 0
+        recentMinute = 0
+        timestamps = []
+    }
+    func refreshRecent() {
+        let now = Date()
+        timestamps.removeAll { now.timeIntervalSince($0) > 60 }
+        recentMinute = timestamps.count
+    }
+}
+
+private enum AGTMDbNetwork {
+    static func data(from url: URL) async throws -> (Data, URLResponse) {
+        await AGTMDbDiagnostics.shared.recordRequest()
+        let (data, response) = try await URLSession.shared.data(from: url)
+        await AGTMDbDiagnostics.shared.recordResponse(response)
+        return (data, response)
+    }
+    static func data(for request: URLRequest) async throws -> (Data, URLResponse) {
+        await AGTMDbDiagnostics.shared.recordRequest()
+        let (data, response) = try await URLSession.shared.data(for: request)
+        await AGTMDbDiagnostics.shared.recordResponse(response)
+        return (data, response)
+    }
+}
+
 enum TMDbService {
     static func details(for item: CatalogItem, apiKey: String) async -> MediaDetails? {
         guard !apiKey.isEmpty else { return nil }
@@ -88,7 +141,7 @@ enum TMDbService {
         parts.queryItems = queries
         guard let url = parts.url else { return nil }
         do {
-            let (data, response) = try await URLSession.shared.data(from: url)
+            let (data, response) = try await AGTMDbNetwork.data(from: url)
             guard (response as? HTTPURLResponse)?.statusCode == 200 else { return nil }
             let result: MediaDetails?
             if item.id != nil {
@@ -100,7 +153,7 @@ enum TMDbService {
                     var detailURL = URLComponents(string: "https://api.themoviedb.org/3/\(kind)/\(match.id)")!
                     detailURL.queryItems = [URLQueryItem(name: "api_key", value: apiKey), URLQueryItem(name: "language", value: "it-IT")]
                     if let address = detailURL.url,
-                       let (fullData, fullResponse) = try? await URLSession.shared.data(from: address),
+                       let (fullData, fullResponse) = try? await AGTMDbNetwork.data(from: address),
                        (fullResponse as? HTTPURLResponse)?.statusCode == 200,
                        let fullDetails = try? JSONDecoder().decode(MediaDetails.self, from: fullData) {
                         result = fullDetails
@@ -143,7 +196,7 @@ private enum ActorSearchService {
         func data(_ path: String, params: [URLQueryItem]) async throws -> Data {
             var url = URLComponents(string: "https://api.themoviedb.org/3/" + path)!
             url.queryItems = [URLQueryItem(name: "api_key", value: apiKey), URLQueryItem(name: "language", value: "it-IT")] + params
-            let (payload, response) = try await URLSession.shared.data(from: url.url!)
+            let (payload, response) = try await AGTMDbNetwork.data(from: url.url!)
             guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
             return payload
         }
@@ -1085,7 +1138,7 @@ private enum AGCastService {
         var url = URLComponents(string: "https://api.themoviedb.org/3/\(kind)/\(id)/credits")!
         url.queryItems = [URLQueryItem(name: "api_key", value: apiKey), URLQueryItem(name: "language", value: "it-IT")]
         guard let endpoint = url.url,
-              let (payload, response) = try? await URLSession.shared.data(from: endpoint),
+              let (payload, response) = try? await AGTMDbNetwork.data(from: endpoint),
               (response as? HTTPURLResponse)?.statusCode == 200,
               let credits = try? JSONDecoder().decode(AGCastResponse.self, from: payload) else { return [] }
         return Array(credits.cast.prefix(24))
@@ -1106,6 +1159,8 @@ private struct AGPersonFilmCredit: Decodable, Identifiable {
     let first_air_date: String?
     let poster_path: String?
     let popularity: Double?
+    let character: String?
+    let genre_ids: [Int]?
     var displayTitle: String { title ?? name ?? "Senza titolo" }
     var year: String { String((release_date ?? first_air_date ?? "").prefix(4)) }
     var posterURL: URL? { poster_path.flatMap { URL(string: "https://image.tmdb.org/t/p/w342\($0)") } }
@@ -1130,13 +1185,22 @@ private enum AGFilmographyService {
             URLQueryItem(name: "language", value: "it-IT")
         ]
         guard let url = components.url else { throw URLError(.badURL) }
-        let (data, response) = try await URLSession.shared.data(from: url)
+        let (data, response) = try await AGTMDbNetwork.data(from: url)
         guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
         let decoded = try JSONDecoder().decode(AGPersonFilmographyResponse.self, from: data)
         // Uno stesso titolo può comparire più volte tra i crediti della persona.
         var unique = Set<String>()
         let credits = decoded.cast.filter { credit in
             guard credit.media_type == "movie" || credit.media_type == "tv" else { return false }
+            // Talk, reality e notiziari: apparizioni televisive, non ruoli di recitazione.
+            if credit.media_type == "tv" {
+                let excludedGenres: Set<Int> = [10767, 10764, 10763]
+                if !(excludedGenres.isDisjoint(with: credit.genre_ids ?? [])) { return false }
+            }
+            // Crediti come se stessi: ospitate, interviste, documentari e simili.
+            let role = (credit.character ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            let selfRoles: Set<String> = ["self", "himself", "herself", "themselves", "self - guest", "self - host", "self (archive footage)", "archive footage"]
+            if selfRoles.contains(role) || role.hasPrefix("self - ") { return false }
             return unique.insert("\(credit.media_type)|\(credit.id)").inserted
         }.sorted { ($0.popularity ?? 0) > ($1.popularity ?? 0) }
         await AGFilmographyCache.shared.write(credits, key: cacheKey)
@@ -1155,7 +1219,7 @@ private struct AGActorDetailView: View {
     @State private var selectedExternal: AGPersonFilmCredit?
 
     private var displayed: [AGPersonFilmCredit] {
-        Array(films.prefix(showAll ? 60 : 20))
+        Array(films.prefix(showAll ? films.count : 20))
     }
     private func inCatalog(_ credit: AGPersonFilmCredit) -> CatalogItem? {
         // Preferiamo sempre l'ID TMDb: non confondiamo remake e omonimi.
@@ -1570,7 +1634,7 @@ private struct BlackMirrorEpisodePanel: View {
         var url = URLComponents(string: "https://api.themoviedb.org/3/tv/\(seriesID)/season/\(selectedSeason)")!
         url.queryItems = [URLQueryItem(name: "api_key", value: apiKey), URLQueryItem(name: "language", value: "it-IT")]
         do {
-            let (data, response) = try await URLSession.shared.data(from: url.url!)
+            let (data, response) = try await AGTMDbNetwork.data(from: url.url!)
             guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
             episodes = try JSONDecoder().decode(SeasonEpisodes.self, from: data).episodes
                 .sorted { $0.episode_number < $1.episode_number }
@@ -1581,7 +1645,23 @@ private struct BlackMirrorEpisodePanel: View {
 struct SettingsView: View {
     @EnvironmentObject var store: CatalogStore
     @EnvironmentObject var admin: AdminSession
+    @ObservedObject private var diagnostics = AGTMDbDiagnostics.shared
     @State private var key = ""
+    @State private var keySaved = false
+    @FocusState private var keyFocused: Bool
+
+    private func saveKey() {
+        let cleaned = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty else {
+            keySaved = false
+            return
+        }
+        store.setAPIKey(cleaned)
+        key = cleaned
+        keySaved = true
+        keyFocused = false
+    }
+
     var body: some View {
         Form {
             Section("Amministrazione") {
@@ -1598,8 +1678,27 @@ struct SettingsView: View {
                 SecureField("Chiave API TMDb v3", text: $key)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
-                Button("Salva chiave") { store.setAPIKey(key) }
-                Text("La chiave rimane sul tuo iPhone e non viene inserita nel repository GitHub. Serve per poster e trame.")
+                    .textContentType(.password)
+                    .submitLabel(.done)
+                    .focused($keyFocused)
+                    .onSubmit { saveKey() }
+                    .onChange(of: key) { _ in keySaved = false }
+                Button {
+                    saveKey()
+                } label: {
+                    Label(keySaved ? "Chiave inserita e salvata" : "Salva chiave",
+                          systemImage: keySaved ? "checkmark.circle.fill" : "key.fill")
+                        .foregroundStyle(keySaved ? .green : AGStyle.accent)
+                }
+                .disabled(key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                if keySaved {
+                    Label("Chiave salvata su questo iPhone.", systemImage: "checkmark.shield.fill")
+                        .font(.footnote).foregroundStyle(.green)
+                } else if !store.apiKey.isEmpty {
+                    Label("Una chiave TMDb è già configurata.", systemImage: "checkmark.circle")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+                Text("La chiave rimane sul tuo iPhone e non viene inserita nel repository GitHub. Serve per poster, trame e filmografie.")
                     .font(.footnote).foregroundStyle(.secondary)
             }
             Section("Sincronizzazione") {
@@ -1607,9 +1706,24 @@ struct SettingsView: View {
                 Button("Aggiorna catalogo") { Task { await store.refresh() } }
                 if let error = store.lastError { Text(error).foregroundStyle(.orange) }
             }
+            Section("Impostazioni da nerd") {
+                Label("Diagnostica richieste TMDb", systemImage: "waveform.path.ecg")
+                    .font(.subheadline.weight(.semibold))
+                LabeledContent("Richieste nella sessione", value: "\(diagnostics.sessionRequests)")
+                LabeledContent("Richieste ultimo minuto", value: "\(diagnostics.recentMinute)")
+                LabeledContent("Picco richieste/secondo", value: "\(diagnostics.peakPerSecond)")
+                LabeledContent("Errori HTTP 429", value: "\(diagnostics.http429)")
+                Button("Aggiorna contatori") { diagnostics.refreshRecent() }
+                Button("Azzera contatori", role: .destructive) { diagnostics.clear() }
+                Text("Conta le richieste API TMDb inviate da questa sessione dell'app, anche se falliscono. Non include locandine, chiamate a Google Sheets o Cloudflare. La cache non genera nuove richieste.")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
         }
         .navigationTitle("Impostazioni")
-        .onAppear { key = store.apiKey }
+        .onAppear {
+            key = store.apiKey
+            diagnostics.refreshRecent()
+        }
     }
 }
 
@@ -1809,7 +1923,7 @@ private enum TMDbLookup {
         guard let url = components.url else { throw TMDbLookupError.invalidRequest }
         var request = URLRequest(url: url)
         request.timeoutInterval = 15
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await AGTMDbNetwork.data(for: request)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             throw TMDbLookupError.serviceUnavailable
         }
